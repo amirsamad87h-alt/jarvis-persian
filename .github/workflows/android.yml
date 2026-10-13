@@ -29,7 +29,7 @@ jobs:
       - name: Create Flutter project
         run: flutter create --platforms=android jarvis_app
 
-  ```yaml
+      
       - name: Add voice and AI packages
         working-directory: jarvis_app
         run: |
@@ -40,9 +40,9 @@ jobs:
           flutter pub add url_launcher
           flutter pub add android_intent_plus
           flutter pub add torch_light
-```
+          ```yaml
     
-      ```yaml
+     
       - name: Configure Android permissions
         working-directory: jarvis_app
         run: |
@@ -69,7 +69,7 @@ jobs:
 
           p.write_text(s)
           PY
-```
+          ```yaml
       - name: Write JARVIS app
         working-directory: jarvis_app
         run: |
