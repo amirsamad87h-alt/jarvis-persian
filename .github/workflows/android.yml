@@ -29,10 +29,20 @@ jobs:
       - name: Create Flutter project
         run: flutter create --platforms=android jarvis_app
 
-      - name: Add voice packages
+  ```yaml
+      - name: Add voice and AI packages
         working-directory: jarvis_app
-        run: flutter pub add speech_to_text flutter_tts
-
+        run: |
+          flutter pub add speech_to_text
+          flutter pub add flutter_tts
+          flutter pub add http
+          flutter pub add shared_preferences
+          flutter pub add url_launcher
+          flutter pub add android_intent_plus
+          flutter pub add torch_light
+```
+    
+      ```yaml
       - name: Configure Android permissions
         working-directory: jarvis_app
         run: |
@@ -42,21 +52,24 @@ jobs:
           p = Path("android/app/src/main/AndroidManifest.xml")
           s = p.read_text()
 
-          permissions = """
-              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-              <uses-permission android:name="android.permission.INTERNET"/>
-          """
+          permissions = [
+              'android.permission.RECORD_AUDIO',
+              'android.permission.INTERNET',
+              'android.permission.CAMERA',
+          ]
 
-          if "android.permission.RECORD_AUDIO" not in s:
-              s = s.replace(
-                  "<application",
-                  permissions + "\n    <application",
-                  1
-              )
+          additions = ''.join(
+              f'    <uses-permission android:name="{permission}"/>\n'
+              for permission in permissions
+              if f'android:name="{permission}"' not in s
+          )
+
+          if additions:
+              s = s.replace('<application', additions + '    <application', 1)
 
           p.write_text(s)
           PY
-
+```
       - name: Write JARVIS app
         working-directory: jarvis_app
         run: |
