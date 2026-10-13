@@ -1,5 +1,4 @@
-
-
+```yaml
 name: Build Persian JARVIS APK
 
 on:
@@ -26,21 +25,16 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
       - name: Create Flutter project
         run: flutter create --platforms=android jarvis_app
 
-      - name: Add voice and AI packages
+      - name: Install packages
         working-directory: jarvis_app
         run: |
           flutter pub add speech_to_text
           flutter pub add flutter_tts
-          flutter pub add http
-          flutter pub add shared_preferences
-          flutter pub add url_launcher
-          flutter pub add android_intent_plus
-          flutter pub add torch_light
-
 
       - name: Configure Android permissions
         working-directory: jarvis_app
@@ -54,7 +48,6 @@ jobs:
           permissions = [
               "android.permission.RECORD_AUDIO",
               "android.permission.INTERNET",
-              "android.permission.CAMERA",
           ]
 
           additions = "".join(
@@ -64,7 +57,11 @@ jobs:
           )
 
           if additions:
-              s = s.replace("<application", additions + "    <application", 1)
+              s = s.replace(
+                  "<application",
+                  additions + "    <application",
+                  1
+              )
 
           p.write_text(s)
           PY
@@ -482,7 +479,7 @@ jobs:
                   ),
                   actions: [
                     IconButton(
-                      tooltip: 'وضعیت نمایشی شبکه',
+                      tooltip: 'تغییر حالت نمایشی شبکه',
                       onPressed: () {
                         setState(() => online = !online);
                       },
@@ -569,8 +566,8 @@ jobs:
                                 const SizedBox(width: 8),
                                 statusItem(
                                   Icons.wifi,
-                                  'شبکه',
-                                  online ? 'انتخاب‌شده' : 'محلی',
+                                  'حالت شبکه',
+                                  online ? 'آنلاین' : 'محلی',
                                 ),
                               ],
                             ),
@@ -736,10 +733,6 @@ jobs:
             }
           }
           DART
-
-      - name: Check Flutter code
-        working-directory: jarvis_app
-        run: flutter analyze
 
       - name: Build release APK
         working-directory: jarvis_app
