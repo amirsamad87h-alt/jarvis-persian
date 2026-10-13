@@ -4,6 +4,9 @@ name: Build Persian JARVIS APK
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,10 +26,325 @@ jobs:
         with:
           channel: stable
 
-      - name: Create starter app
+      - name: Create Flutter project
         run: flutter create --platforms=android jarvis_app
 
-      - name: Build APK
+      - name: Add voice packages
+        working-directory: jarvis_app
+        run: flutter pub add speech_to_text flutter_tts
+
+      - name: Configure Android permissions
+        working-directory: jarvis_app
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+          permissions = """
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+          """
+          s = s.replace("<application", permissions + "\n    <application", 1)
+          p.write_text(s)
+          PY
+
+      - name: Write JARVIS app
+        working-directory: jarvis_app
+        run: |
+          cat > lib/main.dart <<'DART'
+          import 'package:flutter/material.dart';
+          import 'package:flutter_tts/flutter_tts.dart';
+          import 'package:speech_to_text/speech_to_text.dart' as stt;
+
+          void main() => runApp(const JarvisApp());
+
+          class JarvisApp extends StatelessWidget {
+            const JarvisApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'JARVIS فارسی',
+                theme: ThemeData(
+                  brightness: Brightness.dark,
+                  scaffoldBackgroundColor: const Color(0xFF07111F),
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: const Color(0xFF00D9FF),
+                    brightness: Brightness.dark,
+                  ),
+                  useMaterial3: true,
+                ),
+                home: const ChatPage(),
+              );
+            }
+          }
+
+          class ChatPage extends StatefulWidget {
+            const ChatPage({super.key});
+
+            @override
+            State<ChatPage> createState() => _ChatPageState();
+          }
+
+          class _ChatPageState extends State<ChatPage> {
+            final input = TextEditingController();
+            final scroll = ScrollController();
+            final speech = stt.SpeechToText();
+            final tts = FlutterTts();
+            final messages = <Map<String, String>>[
+              {
+                'from': 'jarvis',
+                'text': 'سلام! من جارویس فارسی هستم. چطور می‌توانم کمکت کنم؟'
+              }
+            ];
+
+            bool listening = false;
+            bool speaking = false;
+
+            @override
+            void initState() {
+              super.initState();
+              tts.setLanguage('fa-IR');
+              tts.setSpeechRate(0.45);
+            }
+
+            @override
+            void dispose() {
+              input.dispose();
+              scroll.dispose();
+              super.dispose();
+            }
+
+            void addMessage(String from, String text) {
+              setState(() => messages.add({'from': from, 'text': text}));
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (scroll.hasClients) {
+                  scroll.animateTo(
+                    scroll.position.maxScrollExtent,
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeOut,
+                  );
+                }
+              });
+            }
+
+            String answer(String raw) {
+              final q = raw.toLowerCase().trim();
+              if (q.contains('سلام') || q.contains('درود')) {
+                return 'سلام! آماده‌ام. چه کاری برایت انجام بدهم؟';
+              }
+              if (q.contains('اسمت') || q.contains('نامت')) {
+                return 'من جارویس فارسی هستم؛ دستیار شخصی تو.';
+              }
+              if (q.contains('ساعت')) {
+                final n = DateTime.now();
+                return 'ساعت دستگاه ${n.hour}:${n.minute.toString().padLeft(2, '0')} است.';
+              }
+              if (q.contains('تاریخ')) {
+                final n = DateTime.now();
+                return 'تاریخ دستگاه: ${n.year}/${n.month}/${n.day}';
+              }
+              if (q.contains('چه کار') || q.contains('راهنما')) {
+                return 'می‌توانی درباره ساعت، تاریخ یا خودم سؤال کنی. '
+                    'برای پاسخ‌های گسترده‌تر بعداً هوش مصنوعی آنلاین اضافه می‌کنیم.';
+              }
+              if (q.contains('خداحافظ')) {
+                return 'خدانگهدار! هر وقت نیاز داشتی من اینجا هستم.';
+              }
+              return 'پیامت را دریافت کردم: «$raw»\n'
+                  'فعلاً پاسخ‌های من محدود و محلی هستند؛ '
+                  'برای پاسخ هوشمند به سؤال‌های عمومی باید سرویس هوش مصنوعی اضافه شود.';
+            }
+
+            Future<void> send() async {
+              final text = input.text.trim();
+              if (text.isEmpty) return;
+              input.clear();
+              addMessage('user', text);
+              final reply = answer(text);
+              addMessage('jarvis', reply);
+              await speak(reply);
+            }
+
+            Future<void> speak(String text) async {
+              try {
+                await tts.stop();
+                await tts.setLanguage('fa-IR');
+                await tts.speak(text);
+              } catch (_) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('صدای فارسی روی این دستگاه در دسترس نیست.'),
+                    ),
+                  );
+                }
+              }
+            }
+
+            Future<void> listen() async {
+              if (listening) {
+                await speech.stop();
+                setState(() => listening = false);
+                return;
+              }
+              try {
+                final available = await speech.initialize(
+                  onStatus: (status) {
+                    if (status == 'done' || status == 'notListening') {
+                      if (mounted) setState(() => listening = false);
+                    }
+                  },
+                  onError: (_) {
+                    if (mounted) setState(() => listening = false);
+                  },
+                );
+                if (!available) {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('تشخیص گفتار در این دستگاه در دسترس نیست.'),
+                      ),
+                    );
+                  }
+                  return;
+                }
+                setState(() => listening = true);
+                await speech.listen(
+                  localeId: 'fa-IR',
+                  onResult: (result) {
+                    input.text = result.recognizedWords;
+                    input.selection = TextSelection.collapsed(
+                      offset: input.text.length,
+                    );
+                    if (result.finalResult && input.text.trim().isNotEmpty) {
+                      send();
+                    }
+                  },
+                );
+              } catch (_) {
+                if (mounted) {
+                  setState(() => listening = false);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('برای استفاده از میکروفون مجوز لازم است.'),
+                    ),
+                  );
+                }
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Row(
+                    children: [
+                      Icon(Icons.memory, color: Color(0xFF00D9FF)),
+                      SizedBox(width: 10),
+                      Text('JARVIS فارسی'),
+                    ],
+                  ),
+                  backgroundColor: const Color(0xFF0D1B2A),
+                ),
+                body: SafeArea(
+                  child: Column(
+                    children: [
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(20),
+                        child: const Column(
+                          children: [
+                            Icon(Icons.blur_circular,
+                                size: 66, color: Color(0xFF00D9FF)),
+                            SizedBox(height: 8),
+                            Text('دستیار شخصی شما',
+                                style: TextStyle(fontSize: 20)),
+                            SizedBox(height: 4),
+                            Text('آماده دریافت فرمان',
+                                style: TextStyle(color: Colors.white60)),
+                          ],
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      Expanded(
+                        child: ListView.builder(
+                          controller: scroll,
+                          padding: const EdgeInsets.all(12),
+                          itemCount: messages.length,
+                          itemBuilder: (context, index) {
+                            final item = messages[index];
+                            final mine = item['from'] == 'user';
+                            return Align(
+                              alignment: mine
+                                  ? Alignment.centerRight
+                                  : Alignment.centerLeft,
+                              child: Container(
+                                constraints: const BoxConstraints(maxWidth: 320),
+                                margin: const EdgeInsets.symmetric(vertical: 6),
+                                padding: const EdgeInsets.all(13),
+                                decoration: BoxDecoration(
+                                  color: mine
+                                      ? const Color(0xFF075985)
+                                      : const Color(0xFF17283A),
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                                child: Text(
+                                  item['text']!,
+                                  textDirection: TextDirection.rtl,
+                                  style: const TextStyle(fontSize: 16),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(10, 8, 10, 12),
+                        child: Row(
+                          children: [
+                            IconButton.filled(
+                              onPressed: listen,
+                              icon: Icon(listening ? Icons.stop : Icons.mic),
+                              tooltip: 'فرمان صوتی',
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: TextField(
+                                controller: input,
+                                textDirection: TextDirection.rtl,
+                                onSubmitted: (_) => send(),
+                                decoration: InputDecoration(
+                                  hintText: 'پیامت را بنویس...',
+                                  filled: true,
+                                  fillColor: const Color(0xFF17283A),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(22),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton.filled(
+                              onPressed: send,
+                              icon: const Icon(Icons.send),
+                              tooltip: 'ارسال',
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          DART
+
+      - name: Build release APK
         working-directory: jarvis_app
         run: flutter build apk --release
 
