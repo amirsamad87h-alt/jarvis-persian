@@ -41,11 +41,19 @@ jobs:
 
           p = Path("android/app/src/main/AndroidManifest.xml")
           s = p.read_text()
+
           permissions = """
               <uses-permission android:name="android.permission.RECORD_AUDIO"/>
               <uses-permission android:name="android.permission.INTERNET"/>
           """
-          s = s.replace("<application", permissions + "\n    <application", 1)
+
+          if "android.permission.RECORD_AUDIO" not in s:
+              s = s.replace(
+                  "<application",
+                  permissions + "\n    <application",
+                  1
+              )
+
           p.write_text(s)
           PY
 
@@ -54,8 +62,14 @@ jobs:
         run: |
           cat > lib/main.dart <<'DART'
           import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
           import 'package:flutter_tts/flutter_tts.dart';
           import 'package:speech_to_text/speech_to_text.dart' as stt;
+
+          const cyan = Color(0xFF00E5FF);
+          const blue = Color(0xFF168CFF);
+          const bg = Color(0xFF030914);
+          const panel = Color(0xFF0A1929);
 
           void main() => runApp(const JarvisApp());
 
@@ -69,9 +83,9 @@ jobs:
                 title: 'JARVIS فارسی',
                 theme: ThemeData(
                   brightness: Brightness.dark,
-                  scaffoldBackgroundColor: const Color(0xFF07111F),
+                  scaffoldBackgroundColor: bg,
                   colorScheme: ColorScheme.fromSeed(
-                    seedColor: const Color(0xFF00D9FF),
+                    seedColor: cyan,
                     brightness: Brightness.dark,
                   ),
                   useMaterial3: true,
@@ -88,42 +102,58 @@ jobs:
             State<ChatPage> createState() => _ChatPageState();
           }
 
-          class _ChatPageState extends State<ChatPage> {
+          class _ChatPageState extends State<ChatPage>
+              with SingleTickerProviderStateMixin {
             final input = TextEditingController();
             final scroll = ScrollController();
             final speech = stt.SpeechToText();
             final tts = FlutterTts();
+
             final messages = <Map<String, String>>[
               {
                 'from': 'jarvis',
-                'text': 'سلام! من جارویس فارسی هستم. چطور می‌توانم کمکت کنم؟'
+                'text': 'سلام! من جارویس فارسی هستم. سیستم آماده است.'
               }
             ];
 
+            late final AnimationController pulse;
+
             bool listening = false;
-            bool speaking = false;
+            bool online = false;
 
             @override
             void initState() {
               super.initState();
+
+              pulse = AnimationController(
+                vsync: this,
+                duration: const Duration(milliseconds: 2200),
+              )..repeat(reverse: true);
+
               tts.setLanguage('fa-IR');
               tts.setSpeechRate(0.45);
             }
 
             @override
             void dispose() {
+              pulse.dispose();
               input.dispose();
               scroll.dispose();
+              speech.stop();
+              tts.stop();
               super.dispose();
             }
 
             void addMessage(String from, String text) {
-              setState(() => messages.add({'from': from, 'text': text}));
+              setState(() {
+                messages.add({'from': from, 'text': text});
+              });
+
               WidgetsBinding.instance.addPostFrameCallback((_) {
                 if (scroll.hasClients) {
                   scroll.animateTo(
                     scroll.position.maxScrollExtent,
-                    duration: const Duration(milliseconds: 250),
+                    duration: const Duration(milliseconds: 300),
                     curve: Curves.easeOut,
                   );
                 }
@@ -132,39 +162,55 @@ jobs:
 
             String answer(String raw) {
               final q = raw.toLowerCase().trim();
+
               if (q.contains('سلام') || q.contains('درود')) {
                 return 'سلام! آماده‌ام. چه کاری برایت انجام بدهم؟';
               }
+
               if (q.contains('اسمت') || q.contains('نامت')) {
-                return 'من جارویس فارسی هستم؛ دستیار شخصی تو.';
+                return 'من JARVIS هستم؛ دستیار شخصی فارسی شما.';
               }
+
               if (q.contains('ساعت')) {
                 final n = DateTime.now();
                 return 'ساعت دستگاه ${n.hour}:${n.minute.toString().padLeft(2, '0')} است.';
               }
+
               if (q.contains('تاریخ')) {
                 final n = DateTime.now();
                 return 'تاریخ دستگاه: ${n.year}/${n.month}/${n.day}';
               }
-              if (q.contains('چه کار') || q.contains('راهنما')) {
-                return 'می‌توانی درباره ساعت، تاریخ یا خودم سؤال کنی. '
-                    'برای پاسخ‌های گسترده‌تر بعداً هوش مصنوعی آنلاین اضافه می‌کنیم.';
+
+              if (q.contains('وضعیت')) {
+                return 'هسته جارویس فعال است و آماده دریافت فرمان است.';
               }
+
+              if (q.contains('راهنما') || q.contains('چه کار')) {
+                return 'می‌توانی درباره ساعت، تاریخ و وضعیت سیستم سؤال کنی. '
+                    'همچنین می‌توانی از میکروفون برای واردکردن فرمان استفاده کنی.';
+              }
+
               if (q.contains('خداحافظ')) {
-                return 'خدانگهدار! هر وقت نیاز داشتی من اینجا هستم.';
+                return 'خدانگهدار! هر زمان نیاز داشتی برگرد.';
               }
-              return 'پیامت را دریافت کردم: «$raw»\n'
-                  'فعلاً پاسخ‌های من محدود و محلی هستند؛ '
-                  'برای پاسخ هوشمند به سؤال‌های عمومی باید سرویس هوش مصنوعی اضافه شود.';
+
+              return 'پیامت دریافت شد: «$raw»\n'
+                  'برای پاسخ هوشمند به سؤال‌های عمومی، '
+                  'باید سرویس هوش مصنوعی آنلاین اضافه شود.';
             }
 
             Future<void> send() async {
               final text = input.text.trim();
               if (text.isEmpty) return;
+
               input.clear();
+              HapticFeedback.selectionClick();
+
               addMessage('user', text);
+
               final reply = answer(text);
               addMessage('jarvis', reply);
+
               await speak(reply);
             }
 
@@ -174,44 +220,56 @@ jobs:
                 await tts.setLanguage('fa-IR');
                 await tts.speak(text);
               } catch (_) {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('صدای فارسی روی این دستگاه در دسترس نیست.'),
-                    ),
-                  );
-                }
+                if (!mounted) return;
+
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('صدای فارسی در این دستگاه در دسترس نیست.'),
+                  ),
+                );
               }
             }
 
             Future<void> listen() async {
               if (listening) {
                 await speech.stop();
-                setState(() => listening = false);
+                if (mounted) {
+                  setState(() => listening = false);
+                }
                 return;
               }
+
               try {
                 final available = await speech.initialize(
                   onStatus: (status) {
                     if (status == 'done' || status == 'notListening') {
-                      if (mounted) setState(() => listening = false);
+                      if (mounted) {
+                        setState(() => listening = false);
+                      }
                     }
                   },
                   onError: (_) {
-                    if (mounted) setState(() => listening = false);
+                    if (mounted) {
+                      setState(() => listening = false);
+                    }
                   },
                 );
+
                 if (!available) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('تشخیص گفتار در این دستگاه در دسترس نیست.'),
+                  if (!mounted) return;
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'تشخیص گفتار در این دستگاه در دسترس نیست.',
                       ),
-                    );
-                  }
+                    ),
+                  );
                   return;
                 }
+
                 setState(() => listening = true);
+
                 await speech.listen(
                   localeId: 'fa-IR',
                   onResult: (result) {
@@ -219,7 +277,9 @@ jobs:
                     input.selection = TextSelection.collapsed(
                       offset: input.text.length,
                     );
-                    if (result.finalResult && input.text.trim().isNotEmpty) {
+
+                    if (result.finalResult &&
+                        input.text.trim().isNotEmpty) {
                       send();
                     }
                   },
@@ -227,111 +287,432 @@ jobs:
               } catch (_) {
                 if (mounted) {
                   setState(() => listening = false);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('برای استفاده از میکروفون مجوز لازم است.'),
-                    ),
-                  );
                 }
               }
+            }
+
+            Widget glassPanel({
+              required Widget child,
+              EdgeInsets padding = const EdgeInsets.all(14),
+            }) {
+              return Container(
+                padding: padding,
+                decoration: BoxDecoration(
+                  color: panel.withValues(alpha: 0.85),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: cyan.withValues(alpha: 0.24),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: cyan.withValues(alpha: 0.05),
+                      blurRadius: 20,
+                    ),
+                  ],
+                ),
+                child: child,
+              );
+            }
+
+            Widget statusItem(
+              IconData icon,
+              String label,
+              String value,
+            ) {
+              return Expanded(
+                child: glassPanel(
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 12,
+                    horizontal: 5,
+                  ),
+                  child: Column(
+                    children: [
+                      Icon(icon, color: cyan, size: 22),
+                      const SizedBox(height: 7),
+                      Text(
+                        label,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 10,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        value,
+                        style: const TextStyle(
+                          color: cyan,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            Widget core() {
+              return AnimatedBuilder(
+                animation: pulse,
+                builder: (context, child) {
+                  final t = pulse.value;
+
+                  return SizedBox(
+                    width: 190,
+                    height: 190,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Container(
+                          width: 170 + t * 8,
+                          height: 170 + t * 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: cyan.withValues(
+                                alpha: 0.2 + t * 0.3,
+                              ),
+                            ),
+                          ),
+                        ),
+                        Transform.rotate(
+                          angle: t * 0.8,
+                          child: Container(
+                            width: 144,
+                            height: 144,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: blue.withValues(alpha: 0.8),
+                                width: 2,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: cyan.withValues(
+                                    alpha: 0.08 + t * 0.12,
+                                  ),
+                                  blurRadius: 28,
+                                  spreadRadius: 4,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Container(
+                          width: 112,
+                          height: 112,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: RadialGradient(
+                              colors: [
+                                cyan.withValues(alpha: 0.3),
+                                const Color(0xFF075080),
+                                const Color(0xFF061222),
+                              ],
+                            ),
+                            border: Border.all(
+                              color: cyan.withValues(alpha: 0.8),
+                            ),
+                          ),
+                          child: const Icon(
+                            Icons.memory_rounded,
+                            color: cyan,
+                            size: 52,
+                          ),
+                        ),
+                        Positioned(
+                          top: 12,
+                          right: 28,
+                          child: Container(
+                            width: 7,
+                            height: 7,
+                            decoration: const BoxDecoration(
+                              color: Colors.white,
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: cyan,
+                                  blurRadius: 10,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              );
             }
 
             @override
             Widget build(BuildContext context) {
               return Scaffold(
                 appBar: AppBar(
+                  backgroundColor: bg,
                   title: const Row(
                     children: [
-                      Icon(Icons.memory, color: Color(0xFF00D9FF)),
+                      Icon(
+                        Icons.hexagon_outlined,
+                        color: cyan,
+                        size: 28,
+                      ),
                       SizedBox(width: 10),
-                      Text('JARVIS فارسی'),
+                      Text(
+                        'J.A.R.V.I.S',
+                        style: TextStyle(
+                          letterSpacing: 3,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
                     ],
                   ),
-                  backgroundColor: const Color(0xFF0D1B2A),
+                  actions: [
+                    IconButton(
+                      tooltip: 'وضعیت نمایشی شبکه',
+                      onPressed: () {
+                        setState(() => online = !online);
+                      },
+                      icon: Icon(
+                        online ? Icons.cloud_done : Icons.cloud_off,
+                        color: online ? cyan : Colors.white54,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
                 ),
                 body: SafeArea(
                   child: Column(
                     children: [
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(20),
-                        child: const Column(
+                      Expanded(
+                        child: ListView(
+                          controller: scroll,
+                          padding: const EdgeInsets.fromLTRB(
+                            16, 10, 16, 16,
+                          ),
                           children: [
-                            Icon(Icons.blur_circular,
-                                size: 66, color: Color(0xFF00D9FF)),
-                            SizedBox(height: 8),
-                            Text('دستیار شخصی شما',
-                                style: TextStyle(fontSize: 20)),
-                            SizedBox(height: 4),
-                            Text('آماده دریافت فرمان',
-                                style: TextStyle(color: Colors.white60)),
+                            const Center(
+                              child: Text(
+                                'PERSONAL AI INTERFACE',
+                                style: TextStyle(
+                                  color: cyan,
+                                  fontSize: 10,
+                                  letterSpacing: 3,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Center(child: core()),
+                            const SizedBox(height: 8),
+                            const Center(
+                              child: Text(
+                                'هسته مرکزی جارویس',
+                                style: TextStyle(
+                                  fontSize: 21,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Center(
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Container(
+                                    width: 7,
+                                    height: 7,
+                                    decoration: const BoxDecoration(
+                                      color: Color(0xFF39FFB6),
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 7),
+                                  Text(
+                                    listening
+                                        ? 'در حال شنیدن فرمان'
+                                        : 'سیستم آماده دریافت فرمان',
+                                    style: const TextStyle(
+                                      color: Colors.white60,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 22),
+                            Row(
+                              children: [
+                                statusItem(
+                                  Icons.memory,
+                                  'هسته سیستم',
+                                  'فعال',
+                                ),
+                                const SizedBox(width: 8),
+                                statusItem(
+                                  Icons.mic_none,
+                                  'میکروفون',
+                                  listening ? 'شنود' : 'آماده',
+                                ),
+                                const SizedBox(width: 8),
+                                statusItem(
+                                  Icons.wifi,
+                                  'شبکه',
+                                  online ? 'انتخاب‌شده' : 'محلی',
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 22),
+                            Row(
+                              children: [
+                                const Icon(
+                                  Icons.terminal,
+                                  color: cyan,
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 8),
+                                const Text(
+                                  'گزارش ارتباط',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 15,
+                                  ),
+                                ),
+                                const Spacer(),
+                                Text(
+                                  '${messages.length} پیام',
+                                  style: const TextStyle(
+                                    color: Colors.white38,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            ...messages.map((item) {
+                              final mine = item['from'] == 'user';
+
+                              return Align(
+                                alignment: mine
+                                    ? Alignment.centerRight
+                                    : Alignment.centerLeft,
+                                child: Container(
+                                  constraints: const BoxConstraints(
+                                    maxWidth: 320,
+                                  ),
+                                  margin: const EdgeInsets.only(
+                                    bottom: 10,
+                                  ),
+                                  padding: const EdgeInsets.all(14),
+                                  decoration: BoxDecoration(
+                                    color: mine
+                                        ? const Color(0xFF073A59)
+                                        : panel,
+                                    borderRadius: BorderRadius.circular(16),
+                                    border: Border.all(
+                                      color: (mine ? blue : cyan)
+                                          .withValues(alpha: 0.3),
+                                    ),
+                                  ),
+                                  child: Text(
+                                    item['text']!,
+                                    textDirection: TextDirection.rtl,
+                                    style: const TextStyle(
+                                      fontSize: 15,
+                                      height: 1.7,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }),
                           ],
                         ),
                       ),
-                      const Divider(height: 1),
-                      Expanded(
-                        child: ListView.builder(
-                          controller: scroll,
-                          padding: const EdgeInsets.all(12),
-                          itemCount: messages.length,
-                          itemBuilder: (context, index) {
-                            final item = messages[index];
-                            final mine = item['from'] == 'user';
-                            return Align(
-                              alignment: mine
-                                  ? Alignment.centerRight
-                                  : Alignment.centerLeft,
-                              child: Container(
-                                constraints: const BoxConstraints(maxWidth: 320),
-                                margin: const EdgeInsets.symmetric(vertical: 6),
-                                padding: const EdgeInsets.all(13),
-                                decoration: BoxDecoration(
-                                  color: mine
-                                      ? const Color(0xFF075985)
-                                      : const Color(0xFF17283A),
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                                child: Text(
-                                  item['text']!,
-                                  textDirection: TextDirection.rtl,
-                                  style: const TextStyle(fontSize: 16),
-                                ),
-                              ),
-                            );
-                          },
+                      Container(
+                        padding: const EdgeInsets.fromLTRB(
+                          12, 12, 12, 12,
                         ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(10, 8, 10, 12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF06111F),
+                          border: Border(
+                            top: BorderSide(
+                              color: cyan.withValues(alpha: 0.22),
+                            ),
+                          ),
+                        ),
                         child: Row(
                           children: [
-                            IconButton.filled(
-                              onPressed: listen,
-                              icon: Icon(listening ? Icons.stop : Icons.mic),
-                              tooltip: 'فرمان صوتی',
+                            Container(
+                              decoration: BoxDecoration(
+                                color: listening
+                                    ? const Color(0xFF123E55)
+                                    : panel,
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: cyan.withValues(alpha: 0.5),
+                                ),
+                              ),
+                              child: IconButton(
+                                onPressed: listen,
+                                icon: Icon(
+                                  listening
+                                      ? Icons.stop
+                                      : Icons.mic_none,
+                                  color: cyan,
+                                ),
+                                tooltip: 'فرمان صوتی',
+                              ),
                             ),
-                            const SizedBox(width: 8),
+                            const SizedBox(width: 9),
                             Expanded(
                               child: TextField(
                                 controller: input,
                                 textDirection: TextDirection.rtl,
                                 onSubmitted: (_) => send(),
                                 decoration: InputDecoration(
-                                  hintText: 'پیامت را بنویس...',
+                                  hintText: 'فرمان خود را وارد کنید...',
+                                  hintStyle: const TextStyle(
+                                    color: Colors.white38,
+                                    fontSize: 13,
+                                  ),
                                   filled: true,
-                                  fillColor: const Color(0xFF17283A),
+                                  fillColor: panel,
+                                  contentPadding:
+                                      const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 15,
+                                  ),
                                   border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(22),
-                                    borderSide: BorderSide.none,
+                                    borderRadius: BorderRadius.circular(18),
+                                    borderSide: BorderSide(
+                                      color: cyan.withValues(alpha: 0.2),
+                                    ),
+                                  ),
+                                  enabledBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(18),
+                                    borderSide: BorderSide(
+                                      color: cyan.withValues(alpha: 0.2),
+                                    ),
                                   ),
                                 ),
                               ),
                             ),
-                            const SizedBox(width: 8),
-                            IconButton.filled(
-                              onPressed: send,
-                              icon: const Icon(Icons.send),
-                              tooltip: 'ارسال',
+                            const SizedBox(width: 9),
+                            Container(
+                              decoration: const BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [cyan, blue],
+                                ),
+                                shape: BoxShape.circle,
+                              ),
+                              child: IconButton(
+                                onPressed: send,
+                                icon: const Icon(
+                                  Icons.arrow_upward_rounded,
+                                  color: bg,
+                                ),
+                                tooltip: 'ارسال فرمان',
+                              ),
                             ),
                           ],
                         ),
