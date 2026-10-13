@@ -1,4 +1,4 @@
-```yaml
+
 name: Build Persian JARVIS APK
 
 on:
@@ -40,6 +40,7 @@ jobs:
           flutter pub add android_intent_plus
           flutter pub add torch_light
 
+    
       - name: Configure Android permissions
         working-directory: jarvis_app
         run: |
@@ -62,14 +63,11 @@ jobs:
           )
 
           if additions:
-              s = s.replace(
-                  "<application",
-                  additions + "    <application",
-                  1
-              )
+              s = s.replace("<application", additions + "    <application", 1)
 
           p.write_text(s)
           PY
+
 
       - name: Write JARVIS app
         working-directory: jarvis_app
