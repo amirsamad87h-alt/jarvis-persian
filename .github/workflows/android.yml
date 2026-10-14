@@ -63,27 +63,28 @@ jobs:
               raise SystemExit('Could not find vosk_flutter Android build.gradle in Pub cache')
           for gradle in files:
               content = gradle.read_text()
-              if re.search(r"\bnamespace\s+[\'\"]", content):
-                  print(f'Namespace already present: {gradle}')
-                  continue
-              manifest = gradle.parent / 'src/main/AndroidManifest.xml'
-              package_name = None
-              if manifest.exists():
-                  match = re.search(r"<manifest\b[^>]*\bpackage=[\'\"]([^\'\"]+)", manifest.read_text())
-                  if match:
-                      package_name = match.group(1)
-              if not package_name:
-                  package_name = 'com.alphacephei.vosk_flutter'
-              updated, count = re.subn(r'\bandroid\s*\{', lambda m: m.group(0) + f'\n    namespace "{package_name}"', content, count=1)
-              if count != 1:
-                  raise SystemExit(f'Could not insert namespace into {gradle}')
-              gradle.write_text(updated)
-              print(f'Added namespace {package_name} to {gradle}')
 
-          # Vosk 0.3.48 hard-codes compileSdk 33, but its AndroidX dependencies
-          # require API 34+. Raise the plugin's own compile SDK (not just the app's).
-          for gradle in files:
-              content = gradle.read_text()
+              # Add namespace if the legacy plugin does not declare one.
+              if not re.search(r"\bnamespace\s+[\'\"]", content):
+                  manifest = gradle.parent / 'src/main/AndroidManifest.xml'
+                  package_name = None
+                  if manifest.exists():
+                      match = re.search(r"<manifest\b[^>]*\bpackage=[\'\"]([^\'\"]+)", manifest.read_text())
+                      if match:
+                          package_name = match.group(1)
+                  if not package_name:
+                      package_name = 'com.alphacephei.vosk_flutter'
+                  content, count = re.subn(
+                      r'\bandroid\s*\{',
+                      lambda m: m.group(0) + f'\n    namespace "{package_name}"',
+                      content, count=1
+                  )
+                  if count != 1:
+                      raise SystemExit(f'Could not insert namespace into {gradle}')
+                  print(f'Added namespace {package_name} to {gradle}')
+
+              # Vosk 0.3.48 hard-codes compileSdk 33, but its AndroidX dependencies
+              # require API 34+. Update compileSdk even if namespace already exists.
               updated, count = re.subn(
                   r'(?m)(\bcompileSdkVersion\s+)\d+', r'\g<1>35', content
               )
@@ -91,13 +92,11 @@ jobs:
                   updated, count = re.subn(
                       r'(?m)(\bcompileSdk\s*=\s*)\d+', r'\g<1>35', content
                   )
-              if count == 0:
-                  # Insert into the Android block if this plugin uses a variable
-                  # or another older syntax for compileSdk.
+              if count == 0 and not re.search(r'(?m)\bcompileSdkVersion\s+35\b|\bcompileSdk\s*=\s*35\b', content):
                   updated, count = re.subn(
                       r'(?m)(\bandroid\s*\{)', r'\g<1>\n    compileSdkVersion 35', content, count=1
                   )
-              if count == 0:
+              if count == 0 and not re.search(r'(?m)\bcompileSdkVersion\s+35\b|\bcompileSdk\s*=\s*35\b', updated):
                   raise SystemExit(f'Could not set compileSdk 35 in {gradle}')
               gradle.write_text(updated)
               print(f'Updated Vosk plugin compileSdk to 35: {gradle}')
