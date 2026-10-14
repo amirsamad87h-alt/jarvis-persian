@@ -37,6 +37,34 @@ jobs:
           flutter pub add path_provider
           flutter pub add permission_handler
 
+      - name: Fix Vosk Android namespace for modern Gradle
+        working-directory: jarvis_app
+        run: |
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          import re
+          files = list(Path.home().glob('.pub-cache/hosted/pub.dev/vosk_flutter-*/android/build.gradle'))
+          if not files:
+              raise SystemExit('Could not find vosk_flutter Android build.gradle in Pub cache')
+          for gradle in files:
+              content = gradle.read_text()
+              if re.search(r"\bnamespace\s+[\'\"]", content):
+                  print(f'Namespace already present: {gradle}')
+                  continue
+              manifest = gradle.parent / 'src/main/AndroidManifest.xml'
+              package_name = None
+              if manifest.exists():
+                  match = re.search(r"<manifest\b[^>]*\bpackage=[\'\"]([^\'\"]+)", manifest.read_text())
+                  if match:
+                      package_name = match.group(1)
+              if not package_name:
+                  package_name = 'com.alphacephei.vosk_flutter'
+              updated, count = re.subn(r'\bandroid\s*\{', lambda m: m.group(0) + f'\n    namespace "{package_name}"', content, count=1)
+              if count != 1:
+                  raise SystemExit(f'Could not insert namespace into {gradle}')
+              gradle.write_text(updated)
+              print(f'Added namespace {package_name} to {gradle}')
+
       - name: Download bundled offline models
         working-directory: jarvis_app
         run: |
