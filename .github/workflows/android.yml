@@ -108,16 +108,40 @@ jobs:
               gradle.write_text(updated)
               print(f'Updated Vosk plugin compileSdk to 35: {gradle}')
 
-      - name: Download bundled offline models
+      - name: Download bundled offline models (resume on connection drops)
         working-directory: jarvis_app
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p assets/models
-          curl -L --fail --retry 3 --retry-delay 2 \
+
+          download_with_resume() {
+            local url="$1"
+            local dest="$2"
+            local attempt=1
+            touch "${dest}.part"
+            while [ "$attempt" -le 10 ]; do
+              echo "Download attempt ${attempt}/10: ${dest}"
+              if curl --location --fail --show-error --connect-timeout 30 \
+                --continue-at - --output "${dest}.part" "$url"; then
+                mv "${dest}.part" "$dest"
+                return 0
+              fi
+              echo "Connection interrupted; keeping partial file and retrying..."
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+            echo "ERROR: Download failed after 10 attempts: ${dest}" >&2
+            return 1
+          }
+
+          download_with_resume \
             'https://huggingface.co/rhasspy/vosk-models/resolve/main/fa/vosk-model-small-fa-0.5.zip' \
-            -o assets/models/vosk-model-small-fa-0.5.zip
-          curl -L --fail --retry 3 --retry-delay 2 \
+            'assets/models/vosk-model-small-fa-0.5.zip'
+          download_with_resume \
             'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/df5bf01389a39c743ab467d734bf501681e041c5/qwen2.5-0.5b-instruct-q4_k_m.gguf' \
-            -o assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+            'assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf'
+
           test "$(stat -c%s assets/models/vosk-model-small-fa-0.5.zip)" -gt 50000000
           test "$(stat -c%s assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf)" -gt 400000000
 
