@@ -25,6 +25,10 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Install Android API 35
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
       - name: Create Flutter project
         run: flutter create --platforms=android jarvis_app
 
@@ -58,7 +62,7 @@ jobs:
           python3 - <<'PYFIX'
           from pathlib import Path
           import re
-          files = list(Path.home().glob('.pub-cache/hosted/pub.dev/vosk_flutter-*/android/build.gradle'))
+          files = list(Path.home().glob('.pub-cache/hosted/pub.dev/vosk_flutter-*/android/build.gradle*'))
           if not files:
               raise SystemExit('Could not find vosk_flutter Android build.gradle in Pub cache')
           for gradle in files:
@@ -85,19 +89,22 @@ jobs:
 
               # Vosk 0.3.48 hard-codes compileSdk 33, but its AndroidX dependencies
               # require API 34+. Update compileSdk even if namespace already exists.
+              # Handle Groovy and Kotlin-style assignments, with or without '=':
+              # compileSdkVersion 33, compileSdkVersion = 33, compileSdk = 33.
+              # Rewrite the actual assignment line whether it uses a numeric
+              # value or a Flutter variable, e.g. compileSdkVersion 33 or
+              # compileSdk = flutter.compileSdkVersion.
               updated, count = re.subn(
-                  r'(?m)(\bcompileSdkVersion\s+)\d+', r'\g<1>35', content
+                  r'(?m)^(\s*compileSdk(?:Version)?\s*(?:=\s*)?)([^\s;]+)',
+                  r'\g<1>35', content
               )
               if count == 0:
                   updated, count = re.subn(
-                      r'(?m)(\bcompileSdk\s*=\s*)\d+', r'\g<1>35', content
+                      r'(?m)(\bandroid\s*\{)',
+                      r'\g<1>\n    compileSdkVersion 35', content, count=1
                   )
-              if count == 0 and not re.search(r'(?m)\bcompileSdkVersion\s+35\b|\bcompileSdk\s*=\s*35\b', content):
-                  updated, count = re.subn(
-                      r'(?m)(\bandroid\s*\{)', r'\g<1>\n    compileSdkVersion 35', content, count=1
-                  )
-              if count == 0 and not re.search(r'(?m)\bcompileSdkVersion\s+35\b|\bcompileSdk\s*=\s*35\b', updated):
-                  raise SystemExit(f'Could not set compileSdk 35 in {gradle}')
+              if not re.search(r'(?m)^\s*compileSdk(?:Version)?\s*(?:=\s*)?35\b', updated):
+                  raise SystemExit(f'Could not set/verify compileSdk 35 in {gradle}')
               gradle.write_text(updated)
               print(f'Updated Vosk plugin compileSdk to 35: {gradle}')
 
