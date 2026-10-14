@@ -35,9 +35,22 @@ jobs:
           flutter pub add vosk_flutter
           flutter pub add llama_flutter_android
           flutter pub add path_provider
-          # Pin a modern release: older permission_handler_android 10.x
-          # still references the removed PluginRegistry.Registrar API.
-          flutter pub add permission_handler:^12.0.3
+          # vosk_flutter 0.3.48 requires permission_handler ^10.x, so adding
+          # v12 directly causes Pub's version solver to fail. Let the other
+          # packages resolve first, then apply a deliberate override below.
+          flutter pub get
+
+      - name: Override obsolete Vosk permission dependency
+        working-directory: jarvis_app
+        run: |
+          cat >> pubspec.yaml <<'PUBSPEC'
+
+          dependency_overrides:
+            # Vosk 0.3.48 pins the old API, whose Android implementation fails
+            # on modern Flutter because it uses PluginRegistry.Registrar.
+            permission_handler: 12.0.3
+          PUBSPEC
+          flutter pub get
 
       - name: Fix Vosk Android namespace for modern Gradle
         working-directory: jarvis_app
