@@ -1,4 +1,4 @@
-name: Build JARVIS - Persian Text and Turkish Voice
+name: Build JARVIS - Persian Voice Commands and Turkish TTS
 
 on:
   workflow_dispatch:
@@ -171,6 +171,9 @@ jobs:
           s = s.replace('<application',
               '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
               '    <uses-permission android:name="android.permission.INTERNET" />\n'
+              '    <uses-permission android:name="android.permission.READ_CONTACTS" />\n'
+              '    <uses-permission android:name="android.permission.CALL_PHONE" />\n'
+              '    <queries><intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent></queries>\n'
               '    <application', 1)
           manifest.write_text(s)
 
@@ -178,9 +181,16 @@ jobs:
           proguard = Path('android/app/proguard-rules.pro')
           proguard.parent.mkdir(parents=True, exist_ok=True)
           rules = proguard.read_text() if proguard.exists() else ''
-          required = '-keep class com.sun.jna.** { *; }\n-keepclassmembers class * extends com.sun.jna.** { *; }\n'
-          if '-keep class com.sun.jna.' not in rules:
-              proguard.write_text(rules + ('\n' if rules and not rules.endswith('\n') else '') + required)
+          required = (
+              '-keep class com.sun.jna.** { *; }\n'
+              '-keepclassmembers class * extends com.sun.jna.** { *; }\n'
+              # JNA contains optional desktop AWT references that do not exist on Android.
+              '-dontwarn java.awt.**\n'
+          )
+          for rule in required.splitlines():
+              if rule not in rules.splitlines():
+                  rules += ('\n' if rules and not rules.endswith('\n') else '') + rule + '\n'
+          proguard.write_text(rules)
 
           gradle = Path('android/app/build.gradle.kts')
           if gradle.exists():
@@ -188,6 +198,105 @@ jobs:
               g = g.replace('minSdk = flutter.minSdkVersion', 'minSdk = 26')
               gradle.write_text(g)
           PY
+
+      - name: Add Android bridge for launching apps and calling contacts
+        working-directory: jarvis_app
+        run: |
+          mkdir -p android/app/src/main/kotlin/com/example/jarvis_app
+          cat > android/app/src/main/kotlin/com/example/jarvis_app/MainActivity.kt <<'KOTLIN'
+          package com.example.jarvis_app
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.provider.ContactsContract
+          import android.provider.Settings
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+            private val channelName = "jarvis/device"
+
+            override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+              super.configureFlutterEngine(flutterEngine)
+              MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
+                when (call.method) {
+                  "launchApp" -> {
+                    val name = call.argument<String>("name")?.trim().orEmpty()
+                    result.success(launchApp(name))
+                  }
+                  "goHome" -> {
+                    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                    intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    startActivity(intent)
+                    result.success(mapOf("ok" to true, "message" to "به صفحهٔ اصلی برگشتم."))
+                  }
+                  "callContact" -> {
+                    val name = call.argument<String>("name")?.trim().orEmpty()
+                    result.success(callContact(name))
+                  }
+                  else -> result.notImplemented()
+                }
+              }
+            }
+
+            private fun normalize(value: String): String = value.lowercase().trim()
+              .replace("ي", "ی").replace("ك", "ک")
+              .replace(Regex("\\s+"), " ")
+
+            private fun launchApp(query: String): Map<String, Any> {
+              if (query.isBlank()) return mapOf("ok" to false, "message" to "نام برنامه را متوجه نشدم.")
+              val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+              val apps = packageManager.queryIntentActivities(intent, 0)
+              val q = normalize(query)
+              val match = apps.firstOrNull { normalize(it.loadLabel(packageManager).toString()) == q }
+                ?: apps.firstOrNull { normalize(it.loadLabel(packageManager).toString()).contains(q) }
+                ?: apps.firstOrNull { q.contains(normalize(it.loadLabel(packageManager).toString())) && normalize(it.loadLabel(packageManager).toString()).length > 2 }
+              if (match == null) return mapOf("ok" to false, "message" to "برنامهٔ «$query» را پیدا نکردم. نامش را دقیق‌تر بگو.")
+              val launch = packageManager.getLaunchIntentForPackage(match.activityInfo.packageName)
+                ?: return mapOf("ok" to false, "message" to "برای این برنامه امکان بازکردن پیدا نشد.")
+              launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+              startActivity(launch)
+              return mapOf("ok" to true, "message" to "برنامهٔ ${match.loadLabel(packageManager)} را باز کردم.")
+            }
+
+            private fun callContact(query: String): Map<String, Any> {
+              if (query.isBlank()) return mapOf("ok" to false, "message" to "نام مخاطب را متوجه نشدم.")
+              if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+                return mapOf("ok" to false, "permission" to "contacts", "message" to "برای پیدا کردن مخاطب، اجازهٔ مخاطبین لازم است.")
+              }
+              val cursor = contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER),
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$query%"),
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+              )
+              var displayName: String? = null
+              var number: String? = null
+              cursor?.use {
+                if (it.moveToFirst()) {
+                  displayName = it.getString(0)
+                  number = it.getString(1)
+                }
+              }
+              if (number.isNullOrBlank()) return mapOf("ok" to false, "message" to "مخاطبی با نام «$query» و شمارهٔ قابل‌استفاده پیدا نکردم.")
+              if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                return mapOf("ok" to false, "permission" to "phone", "message" to "برای برقراری مستقیم تماس، اجازهٔ تماس تلفنی لازم است.")
+              }
+              return try {
+                val callIntent = Intent(Intent.ACTION_CALL, Uri.parse("tel:${number!!.replace(" ", "")}"))
+                callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(callIntent)
+                mapOf("ok" to true, "message" to "در حال تماس با ${displayName ?: query}.")
+              } catch (e: SecurityException) {
+                mapOf("ok" to false, "message" to "اندروید اجازهٔ شروع تماس را نداد. مجوز تماس را بررسی کن.")
+              }
+            }
+          }
+          KOTLIN
 
       - name: Write JARVIS app
         working-directory: jarvis_app
@@ -239,6 +348,7 @@ jobs:
             final input = TextEditingController();
             final scroll = ScrollController();
             final tts = FlutterTts();
+            static const deviceChannel = MethodChannel('jarvis/device');
             final llama = LlamaController();
             final vosk = VoskFlutterPlugin.instance();
             final modelLoader = ModelLoader();
@@ -362,6 +472,69 @@ jobs:
               });
             }
 
+            Future<bool> handleDeviceCommand(String raw) async {
+              final q = raw.toLowerCase().replaceAll('ي', 'ی').replaceAll('ك', 'ک').replaceAll('‌', ' ').trim();
+              final homePhrases = ['برگرد صفحه اصلی', 'برو صفحه اصلی', 'برو به صفحه اصلی', 'صفحه اصلی', 'این برنامه رو ببند', 'این برنامه را ببند', 'جارویس رو ببند', 'جارویس را ببند'];
+              if (homePhrases.any(q.contains)) {
+                try {
+                  final result = await deviceChannel.invokeMapMethod<String, dynamic>('goHome');
+                  final reply = (result?['message'] ?? 'به صفحهٔ اصلی برگشتم.').toString();
+                  addMessage('jarvis', reply);
+                } catch (e) {
+                  addMessage('jarvis', 'نتوانستم صفحهٔ اصلی را باز کنم: $e');
+                }
+                return true;
+              }
+
+              final callMatch = RegExp(r'(?:به|با)\s+(.+?)\s+(?:زنگ بزن|زنگ بزنید|تماس بگیر|تماس بزن|تماس بگیرید)').firstMatch(q);
+              if (callMatch != null) {
+                final contact = callMatch.group(1)!.replaceAll(RegExp(r'^(?:آقای|اقای|خانم|مخاطب)\s+'), '').trim();
+                try {
+                  var contacts = await Permission.contacts.status;
+                  if (!contacts.isGranted) contacts = await Permission.contacts.request();
+                  if (!contacts.isGranted) {
+                    addMessage('jarvis', 'برای پیدا کردن مخاطب، مجوز مخاطبین را از تنظیمات گوشی فعال کن.');
+                    return true;
+                  }
+                  var phone = await Permission.phone.status;
+                  if (!phone.isGranted) phone = await Permission.phone.request();
+                  if (!phone.isGranted) {
+                    addMessage('jarvis', 'برای تماس مستقیم، مجوز تماس تلفنی را فعال کن.');
+                    return true;
+                  }
+                  final result = await deviceChannel.invokeMapMethod<String, dynamic>('callContact', {'name': contact});
+                  final reply = (result?['message'] ?? 'فرمان تماس انجام نشد.').toString();
+                  addMessage('jarvis', reply);
+                  if (result?['ok'] != true && mounted) await speak(reply);
+                } catch (e) {
+                  addMessage('jarvis', 'در اجرای فرمان تماس خطایی رخ داد: $e');
+                }
+                return true;
+              }
+
+              final closeOther = RegExp(r'^(.+?)\s+(?:رو|را)\s+ببند$').firstMatch(q);
+              if (closeOther != null && !q.contains('این برنامه') && !q.contains('جارویس')) {
+                addMessage('jarvis', 'اندروید اجازه نمی‌دهد برنامهٔ «${closeOther.group(1)}» را به‌زور متوقف کنم. می‌توانم آن را باز کنم یا تو از صفحهٔ برنامه‌های اخیر ببندیش.');
+                return true;
+              }
+
+              final openMatch = RegExp(r'^(.+?)\s+(?:رو|را)\s+(?:باز کن|بازش کن|اجرا کن|راه اندازی کن)$').firstMatch(q);
+              if (openMatch != null) {
+                var appName = openMatch.group(1)!.trim();
+                appName = appName.replaceFirst(RegExp(r'^(?:جارویس\s+)?(?:برنامه|اپلیکیشن|اپ)\s+'), '').trim();
+                try {
+                  final result = await deviceChannel.invokeMapMethod<String, dynamic>('launchApp', {'name': appName});
+                  final reply = (result?['message'] ?? 'نتوانستم برنامه را باز کنم.').toString();
+                  addMessage('jarvis', reply);
+                  if (result?['ok'] != true && mounted) await speak(reply);
+                } catch (e) {
+                  addMessage('jarvis', 'بازکردن برنامه ناموفق بود: $e');
+                }
+                return true;
+              }
+              return false;
+            }
+
             String offlineAnswer(String raw) {
               final q = raw.toLowerCase().trim();
               if (q.contains('سلام') || q.contains('درود')) return 'سلام! آماده‌ام. چه کاری برایت انجام بدهم؟';
@@ -411,6 +584,7 @@ jobs:
               if (text.isEmpty || thinking) return;
               input.clear(); HapticFeedback.selectionClick(); addMessage('user', text);
               final q = text.toLowerCase();
+              if (await handleDeviceCommand(text)) return;
               final local = ['ساعت', 'تاریخ', 'سلام', 'درود', 'اسمت', 'نامت', 'معرفی کن', 'خودت را معرفی', 'خودتو معرفی', 'خداحافظ', 'راهنما', 'چه کار', 'وضعیت'].any(q.contains);
               if (local) { final reply = offlineAnswer(text); addMessage('jarvis', reply); await speak(reply); return; }
               if (!modelsReady) { final reply = 'مدل محلی هنوز در حال بارگذاری است؛ چند لحظه صبر کن.'; addMessage('jarvis', reply); await speak(reply); return; }
@@ -560,7 +734,7 @@ jobs:
 
       - name: Build release APK
         working-directory: jarvis_app
-        run: flutter build apk --release
+        run: flutter build apk --release --no-shrink
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
