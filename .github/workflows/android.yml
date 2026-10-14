@@ -1,4 +1,4 @@
-name: Build Persian JARVIS - Fully Offline
+name: Build JARVIS - Persian Text and Turkish Voice
 
 on:
   workflow_dispatch:
@@ -165,13 +165,22 @@ jobs:
           if 'xmlns:tools=' not in s:
               s = s.replace('xmlns:android="http://schemas.android.com/apk/res/android"',
                             'xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools"', 1)
-          s = re.sub(r'\s*<uses-permission android:name="android\.permission\.INTERNET"\s*/>', '', s)
-          s = re.sub(r'\s*<uses-permission android:name="android\.permission\.RECORD_AUDIO"\s*/>', '', s)
+          # Ensure both permissions are present in the final merged manifest.
+          s = re.sub(r'\s*<uses-permission android:name="android\.permission\.INTERNET"[^>]*/>', '', s)
+          s = re.sub(r'\s*<uses-permission android:name="android\.permission\.RECORD_AUDIO"[^>]*/>', '', s)
           s = s.replace('<application',
               '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
-              '    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />\n'
+              '    <uses-permission android:name="android.permission.INTERNET" />\n'
               '    <application', 1)
           manifest.write_text(s)
+
+          # Vosk's Android release builds need JNA keep rules.
+          proguard = Path('android/app/proguard-rules.pro')
+          proguard.parent.mkdir(parents=True, exist_ok=True)
+          rules = proguard.read_text() if proguard.exists() else ''
+          required = '-keep class com.sun.jna.** { *; }\n-keepclassmembers class * extends com.sun.jna.** { *; }\n'
+          if '-keep class com.sun.jna.' not in rules:
+              proguard.write_text(rules + ('\n' if rules and not rules.endswith('\n') else '') + required)
 
           gradle = Path('android/app/build.gradle.kts')
           if gradle.exists():
@@ -209,7 +218,7 @@ jobs:
             @override
             Widget build(BuildContext context) => MaterialApp(
               debugShowCheckedModeBanner: false,
-              title: 'JARVIS فارسی آفلاین',
+              title: 'JARVIS فارسی با صدای ترکی',
               theme: ThemeData(
                 brightness: Brightness.dark,
                 scaffoldBackgroundColor: bg,
@@ -253,8 +262,8 @@ jobs:
             void initState() {
               super.initState();
               pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 2200))..repeat(reverse: true);
-              tts.setLanguage('fa-IR');
-              tts.setSpeechRate(0.45);
+              tts.setSpeechRate(0.46);
+              tts.setPitch(1.0);
               initializeOfflineModels();
             }
 
@@ -290,7 +299,7 @@ jobs:
               } catch (e) {
                 speechError = e.toString();
                 if (mounted) {
-                  setState(() => systemStatus = 'گفتار آماده نیست؛ چت متنی قابل استفاده است');
+                  setState(() => systemStatus = 'خطای گفتار: ${e.toString()}');
                   addMessage('jarvis', 'راه‌اندازی میکروفون ناموفق بود: $speechError');
                 }
               }
@@ -314,12 +323,12 @@ jobs:
                   contextSize: 2048,
                   gpuLayers: gpu.recommendedGpuLayers,
                 );
-                chatHistory.add(ChatMessage(role: 'system', content: 'تو JARVIS، دستیار شخصی فارسی هستی. به فارسی روان، کوتاه و مفید پاسخ بده. اگر پاسخ را نمی‌دانی، صادقانه بگو. ادعا نکن که به امکانات گوشی دسترسی داری یا کاری را انجام داده‌ای مگر واقعاً انجام شده باشد. تمام پردازش‌ها روی همین دستگاه انجام می‌شوند.'));
+                chatHistory.add(ChatMessage(role: 'system', content: 'تو JARVIS، دستیار شخصی فارسی هستی. همیشه متن پاسخ را فقط به فارسی روان، کوتاه و مفید بنویس؛ کاربر متن فارسی می‌خواهد. اگر پاسخ را نمی‌دانی، صادقانه بگو. ادعا نکن که به امکانات گوشی دسترسی داری یا کاری را انجام داده‌ای مگر واقعاً انجام شده باشد. تمام پردازش‌ها روی همین دستگاه انجام می‌شوند.'));
                 if (!mounted) return;
                 setState(() { modelsReady = true; systemStatus = speechService == null ? 'مدل زبانی آماده؛ گفتار غیرفعال' : 'کاملاً آفلاین و آماده'; });
                 addMessage('jarvis', speechService == null
                     ? 'مدل زبانی آماده است، اما تشخیص گفتار راه‌اندازی نشد. فعلاً از کادر تایپ استفاده کن. جزئیات خطای گفتار: $speechError'
-                    : 'مدل‌های محلی بارگذاری شدند. اکنون می‌توانی بدون اینترنت با من گفت‌وگو کنی.');
+                    : 'مدل‌های محلی بارگذاری شدند. متن پاسخ‌ها فارسی می‌ماند و صدای پاسخ به ترکی استانبولی تبدیل می‌شود.');
               } catch (e) {
                 if (!mounted) return;
                 setState(() => systemStatus = 'مدل زبانی بارگذاری نشد');
@@ -411,9 +420,51 @@ jobs:
               setState(() => thinking = false); addMessage('jarvis', reply); await speak(reply);
             }
 
-            Future<void> speak(String text) async {
-              try { await tts.stop(); await tts.setLanguage('fa-IR'); await tts.speak(text); }
-              catch (_) { if (!mounted) return; ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('صدای فارسی روی دستگاه نصب نیست. از تنظیمات تبدیل متن به گفتار، صدای فارسی آفلاین را نصب کن.'))); }
+            Future<String> translateForTurkishSpeech(String persianText) async {
+              if (!modelsReady) return 'Lütfen birkaç saniye bekleyin.';
+              final buffer = StringBuffer();
+              final completer = Completer<String>();
+              StreamSubscription<String>? subscription;
+              subscription = llama.generateChat(
+                messages: [
+                  ChatMessage(role: 'system', content: 'Translate the Persian text into natural, fluent Turkish as spoken in Turkey (Türkiye Türkçesi). Return only the Turkish translation. Do not explain, do not add quotation marks, and do not answer the content; translate it faithfully.'),
+                  ChatMessage(role: 'user', content: persianText),
+                ],
+                template: 'chatml',
+                temperature: 0.2,
+                maxTokens: 180,
+              ).listen(
+                (token) => buffer.write(token),
+                onError: (Object error) { if (!completer.isCompleted) completer.completeError(error); },
+                onDone: () { if (!completer.isCompleted) completer.complete(buffer.toString().trim()); },
+              );
+              try {
+                final translated = await completer.future.timeout(const Duration(seconds: 45));
+                await subscription.cancel();
+                return translated.isEmpty ? 'Şu anda yanıt veremiyorum.' : translated;
+              } catch (_) {
+                await subscription.cancel();
+                return 'Yanıtınız ekranda görüntüleniyor.';
+              }
+            }
+
+            Future<void> speak(String persianText) async {
+              try {
+                final turkishText = await translateForTurkishSpeech(persianText);
+                await tts.stop();
+                final available = await tts.isLanguageAvailable('tr-TR');
+                if (available != true) {
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('صدای ترکی استانبولی روی گوشی موجود نیست. از تنظیمات تبدیل متن به گفتار، صدای ترکی (ترکیه) را نصب یا انتخاب کن. متن فارسی همچنان نمایش داده می‌شود.')));
+                  return;
+                }
+                await tts.setLanguage('tr-TR');
+                await tts.setSpeechRate(0.46);
+                await tts.speak(turkishText);
+              } catch (e) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('پخش صدای ترکی انجام نشد. در تنظیمات تبدیل متن به گفتار گوشی، موتور و صدای ترکی استانبولی را نصب کن.')));
+              }
             }
 
             Future<void> listen() async {
