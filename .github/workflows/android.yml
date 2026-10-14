@@ -1,410 +1,943 @@
-name: Build Persian JARVIS - Fully Offline
 
-on:
-  workflow_dispatch:
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
-permissions:
-  contents: read
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:llama_flutter_android/llama_flutter_android.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:vosk_flutter/vosk_flutter.dart';
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+const cyan = Color(0xFF00E5FF);
+const blue = Color(0xFF168CFF);
+const bg = Color(0xFF030914);
+const panel = Color(0xFF0A1929);
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+const llmAsset =
+    'assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf';
+const voskAsset = 'assets/models/vosk-model-small-fa-0.5.zip';
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
+void main() => runApp(const JarvisApp());
 
-      - name: Create Flutter project
-        run: flutter create --platforms=android jarvis_app
+class JarvisApp extends StatelessWidget {
+  const JarvisApp({super.key});
 
-      - name: Install offline packages
-        working-directory: jarvis_app
-        run: |
-          flutter pub add flutter_tts
-          flutter pub add vosk_flutter
-          flutter pub add llama_flutter_android
-          flutter pub add path_provider
-          flutter pub add permission_handler
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'JARVIS فارسی آفلاین',
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: bg,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: cyan,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      home: const ChatPage(),
+    );
+  }
+}
 
-      - name: Fix Vosk Android namespace for modern Gradle
-        working-directory: jarvis_app
-        run: |
-          python3 - <<'PYFIX'
-          from pathlib import Path
-          import re
-          files = list(Path.home().glob('.pub-cache/hosted/pub.dev/vosk_flutter-*/android/build.gradle'))
-          if not files:
-              raise SystemExit('Could not find vosk_flutter Android build.gradle in Pub cache')
-          for gradle in files:
-              content = gradle.read_text()
-              if re.search(r"\bnamespace\s+[\'\"]", content):
-                  print(f'Namespace already present: {gradle}')
-                  continue
-              manifest = gradle.parent / 'src/main/AndroidManifest.xml'
-              package_name = None
-              if manifest.exists():
-                  match = re.search(r"<manifest\b[^>]*\bpackage=[\'\"]([^\'\"]+)", manifest.read_text())
-                  if match:
-                      package_name = match.group(1)
-              if not package_name:
-                  package_name = 'com.alphacephei.vosk_flutter'
-              updated, count = re.subn(r'\bandroid\s*\{', lambda m: m.group(0) + f'\n    namespace "{package_name}"', content, count=1)
-              if count != 1:
-                  raise SystemExit(f'Could not insert namespace into {gradle}')
-              gradle.write_text(updated)
-              print(f'Added namespace {package_name} to {gradle}')
+class ChatPage extends StatefulWidget {
+  const ChatPage({super.key});
 
-      - name: Download bundled offline models
-        working-directory: jarvis_app
-        run: |
-          mkdir -p assets/models
-          curl -L --fail --retry 3 --retry-delay 2 \
-            'https://huggingface.co/rhasspy/vosk-models/resolve/main/fa/vosk-model-small-fa-0.5.zip' \
-            -o assets/models/vosk-model-small-fa-0.5.zip
-          curl -L --fail --retry 3 --retry-delay 2 \
-            'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/df5bf01389a39c743ab467d734bf501681e041c5/qwen2.5-0.5b-instruct-q4_k_m.gguf' \
-            -o assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-          test "$(stat -c%s assets/models/vosk-model-small-fa-0.5.zip)" -gt 50000000
-          test "$(stat -c%s assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf)" -gt 400000000
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
 
-      - name: Configure offline assets and Android permissions
-        working-directory: jarvis_app
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          pub = Path('pubspec.yaml')
-          s = pub.read_text()
-          if 'assets/models/vosk-model-small-fa-0.5.zip' not in s:
-              s = s.replace(
-                  'flutter:\n  uses-material-design: true',
-                  'flutter:\n  uses-material-design: true\n  assets:\n    - assets/models/vosk-model-small-fa-0.5.zip\n    - assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf'
-              )
-          pub.write_text(s)
+class _ChatPageState extends State<ChatPage>
+    with SingleTickerProviderStateMixin {
+  final input = TextEditingController();
+  final scroll = ScrollController();
+  final tts = FlutterTts();
+  final llama = LlamaController();
+  final vosk = VoskFlutterPlugin.instance();
+  final modelLoader = ModelLoader();
 
-          manifest = Path('android/app/src/main/AndroidManifest.xml')
-          s = manifest.read_text()
-          if 'xmlns:tools=' not in s:
-              s = s.replace('xmlns:android="http://schemas.android.com/apk/res/android"',
-                            'xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools"', 1)
-          s = re.sub(r'\s*<uses-permission android:name="android\.permission\.INTERNET"\s*/>', '', s)
-          s = re.sub(r'\s*<uses-permission android:name="android\.permission\.RECORD_AUDIO"\s*/>', '', s)
-          s = s.replace('<application',
-              '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
-              '    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />\n'
-              '    <application', 1)
-          manifest.write_text(s)
+  final messages = <Map<String, String>>[
+    {
+      'from': 'jarvis',
+      'text':
+          'سلام! من جارویس فارسی هستم. مدل‌های آفلاین در حال آماده‌سازی هستند.',
+    },
+  ];
 
-          gradle = Path('android/app/build.gradle.kts')
-          if gradle.exists():
-              g = gradle.read_text()
-              g = g.replace('minSdk = flutter.minSdkVersion', 'minSdk = 26')
-              gradle.write_text(g)
-          PY
+  final chatHistory = <ChatMessage>[];
 
-      - name: Write JARVIS app
-        working-directory: jarvis_app
-        run: |
-          cat > lib/main.dart <<'DART'
-          import 'dart:async';
-          import 'dart:convert';
-          import 'dart:io';
-          import 'package:flutter/material.dart';
-          import 'package:flutter/services.dart';
-          import 'package:flutter_tts/flutter_tts.dart';
-          import 'package:llama_flutter_android/llama_flutter_android.dart';
-          import 'package:path_provider/path_provider.dart';
-          import 'package:permission_handler/permission_handler.dart';
-          import 'package:vosk_flutter/vosk_flutter.dart';
+  late final AnimationController pulse;
 
-          const cyan = Color(0xFF00E5FF);
-          const blue = Color(0xFF168CFF);
-          const bg = Color(0xFF030914);
-          const panel = Color(0xFF0A1929);
-          const llmAsset = 'assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf';
-          const voskAsset = 'assets/models/vosk-model-small-fa-0.5.zip';
+  Model? speechModel;
+  Recognizer? recognizer;
+  SpeechService? speechService;
 
-          void main() => runApp(const JarvisApp());
+  StreamSubscription<dynamic>? resultSubscription;
+  StreamSubscription<dynamic>? partialSubscription;
 
-          class JarvisApp extends StatelessWidget {
-            const JarvisApp({super.key});
-            @override
-            Widget build(BuildContext context) => MaterialApp(
-              debugShowCheckedModeBanner: false,
-              title: 'JARVIS فارسی آفلاین',
-              theme: ThemeData(
-                brightness: Brightness.dark,
-                scaffoldBackgroundColor: bg,
-                colorScheme: ColorScheme.fromSeed(seedColor: cyan, brightness: Brightness.dark),
-                useMaterial3: true,
+  bool listening = false;
+  bool thinking = false;
+  bool modelsReady = false;
+
+  String systemStatus = 'در حال بارگذاری مدل‌های آفلاین';
+
+  @override
+  void initState() {
+    super.initState();
+
+    pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    )..repeat(reverse: true);
+
+    tts.setLanguage('fa-IR');
+    tts.setSpeechRate(0.45);
+
+    initializeOfflineModels();
+  }
+
+  Future<void> initializeOfflineModels() async {
+    try {
+      if (mounted) {
+        setState(() {
+          systemStatus = 'آماده‌سازی مدل گفتار فارسی';
+        });
+      }
+
+      final voskPath = await modelLoader.loadFromAssets(voskAsset);
+
+      speechModel = await vosk.createModel(voskPath);
+
+      recognizer = await vosk.createRecognizer(
+        model: speechModel!,
+        sampleRate: 16000,
+      );
+
+      speechService = await vosk.initSpeechService(recognizer!);
+
+      resultSubscription = speechService!.onResult().listen((event) {
+        final text = extractRecognizedText(event.toString());
+
+        if (text.isNotEmpty && listening && mounted) {
+          setState(() => listening = false);
+
+          speechService?.stop();
+
+          input.text = text;
+          input.selection = TextSelection.collapsed(
+            offset: input.text.length,
+          );
+
+          send();
+        }
+      });
+
+      partialSubscription = speechService!.onPartial().listen((event) {
+        final text = extractRecognizedText(event.toString());
+
+        if (text.isNotEmpty && listening && mounted) {
+          input.text = text;
+          input.selection = TextSelection.collapsed(
+            offset: input.text.length,
+          );
+        }
+      });
+
+      if (mounted) {
+        setState(() {
+          systemStatus = 'آماده‌سازی مدل زبانی محلی';
+        });
+      }
+
+      final directory = await getApplicationSupportDirectory();
+
+      final modelFile = File(
+        '${directory.path}/qwen2.5-0.5b-instruct-q4_k_m.gguf',
+      );
+
+      if (!await modelFile.exists() ||
+          await modelFile.length() < 400000000) {
+        final data = await rootBundle.load(llmAsset);
+
+        await modelFile.writeAsBytes(
+          data.buffer.asUint8List(
+            data.offsetInBytes,
+            data.lengthInBytes,
+          ),
+          flush: true,
+        );
+      }
+
+      final gpu = await llama.detectGpu();
+
+      await llama.loadModel(
+        modelPath: modelFile.path,
+        threads: 4,
+        contextSize: 2048,
+        gpuLayers: gpu.recommendedGpuLayers,
+      );
+
+      chatHistory.add(
+        ChatMessage(
+          role: 'system',
+          content:
+              'تو JARVIS، دستیار شخصی فارسی هستی. '
+              'به فارسی روان، کوتاه و مفید پاسخ بده. '
+              'اگر پاسخ را نمی‌دانی، صادقانه بگو. '
+              'ادعا نکن که به امکانات گوشی دسترسی داری یا کاری را '
+              'انجام داده‌ای مگر واقعاً انجام شده باشد. '
+              'تمام پردازش‌ها روی همین دستگاه انجام می‌شوند.',
+        ),
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        modelsReady = true;
+        systemStatus = 'کاملاً آفلاین و آماده';
+      });
+
+      addMessage(
+        'jarvis',
+        'مدل محلی بارگذاری شد. اکنون می‌توانی بدون اینترنت با من گفت‌وگو کنی.',
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        systemStatus = 'خطا در بارگذاری مدل آفلاین';
+      });
+
+      addMessage(
+        'jarvis',
+        'بارگذاری مدل انجام نشد. جزئیات: $e',
+      );
+    }
+  }
+
+  String extractRecognizedText(String raw) {
+    try {
+      final value = jsonDecode(raw);
+
+      if (value is Map) {
+        return (value['text'] ?? value['partial'] ?? '')
+            .toString()
+            .trim();
+      }
+    } catch (_) {}
+
+    return raw.trim();
+  }
+
+  @override
+  void dispose() {
+    resultSubscription?.cancel();
+    partialSubscription?.cancel();
+
+    speechService?.stop();
+    llama.dispose();
+
+    pulse.dispose();
+    input.dispose();
+    scroll.dispose();
+    tts.stop();
+
+    super.dispose();
+  }
+
+  void addMessage(String from, String text) {
+    if (!mounted) return;
+
+    setState(() {
+      messages.add({
+        'from': from,
+        'text': text,
+      });
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (scroll.hasClients) {
+        scroll.animateTo(
+          scroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  String offlineAnswer(String raw) {
+    final q = raw.toLowerCase().trim();
+
+    if (q.contains('سلام') || q.contains('درود')) {
+      return 'سلام! آماده‌ام. چه کاری برایت انجام بدهم؟';
+    }
+
+    if (q.contains('اسمت') || q.contains('نامت')) {
+      return 'من JARVIS هستم؛ دستیار شخصی فارسی شما.';
+    }
+
+    if (q.contains('ساعت')) {
+      final n = DateTime.now();
+
+      return 'ساعت دستگاه ${n.hour}:${n.minute.toString().padLeft(2, '0')} است.';
+    }
+
+    if (q.contains('تاریخ')) {
+      final n = DateTime.now();
+
+      return 'تاریخ دستگاه: ${n.year}/${n.month}/${n.day}';
+    }
+
+    if (q.contains('وضعیت')) {
+      return 'هسته جارویس فعال است. حالت اجرا: کاملاً آفلاین. '
+          'مدل زبانی: ${modelsReady ? 'آماده' : 'در حال بارگذاری'}.';
+    }
+
+    if (q.contains('راهنما') || q.contains('چه کار')) {
+      return 'می‌توانم به کمک مدل محلی به سؤال‌ها پاسخ بدهم و '
+          'ساعت و تاریخ دستگاه را اعلام کنم. برای گفتار فارسی، '
+          'مدل آفلاین گفتار نیز همراه برنامه است.';
+    }
+
+    if (q.contains('خداحافظ')) {
+      return 'خداحافظ! هر زمان نیاز داشتی برگرد.';
+    }
+
+    return 'مدل زبانی هنوز آماده نیست. چند لحظه صبر کن و دوباره تلاش کن.';
+  }
+
+  Future<String> askLocal(String prompt) async {
+    if (!modelsReady) return offlineAnswer(prompt);
+
+    chatHistory.add(
+      ChatMessage(
+        role: 'user',
+        content: prompt,
+      ),
+    );
+
+    if (chatHistory.length > 13) {
+      chatHistory.removeRange(1, chatHistory.length - 12);
+    }
+
+    final buffer = StringBuffer();
+    final completer = Completer<String>();
+
+    StreamSubscription<String>? subscription;
+
+    subscription = llama
+        .generateChat(
+          messages: List<ChatMessage>.from(chatHistory),
+          template: 'chatml',
+          temperature: 0.7,
+          maxTokens: 256,
+        )
+        .listen(
+          (token) => buffer.write(token),
+          onError: (Object error) {
+            if (!completer.isCompleted) {
+              completer.completeError(error);
+            }
+          },
+          onDone: () {
+            if (!completer.isCompleted) {
+              completer.complete(buffer.toString().trim());
+            }
+          },
+        );
+
+    try {
+      final reply = await completer.future.timeout(
+        const Duration(minutes: 2),
+      );
+
+      await subscription.cancel();
+
+      if (reply.isEmpty) {
+        throw Exception('مدل پاسخ خالی داد');
+      }
+
+      chatHistory.add(
+        ChatMessage(
+          role: 'assistant',
+          content: reply,
+        ),
+      );
+
+      return reply;
+    } catch (_) {
+      await subscription.cancel();
+
+      if (chatHistory.length > 1) {
+        chatHistory.removeLast();
+      }
+
+      return offlineAnswer(prompt);
+    }
+  }
+
+  Future<void> send() async {
+    final text = input.text.trim();
+
+    if (text.isEmpty || thinking) return;
+
+    input.clear();
+
+    HapticFeedback.selectionClick();
+
+    addMessage('user', text);
+
+    final q = text.toLowerCase();
+
+    final local = [
+      'ساعت',
+      'تاریخ',
+      'سلام',
+      'درود',
+      'اسمت',
+      'نامت',
+      'خداحافظ',
+      'راهنما',
+      'چه کار',
+      'وضعیت',
+    ].any(q.contains);
+
+    if (local) {
+      final reply = offlineAnswer(text);
+
+      addMessage('jarvis', reply);
+
+      await speak(reply);
+
+      return;
+    }
+
+    if (!modelsReady) {
+      const reply =
+          'مدل محلی هنوز در حال بارگذاری است؛ چند لحظه صبر کن.';
+
+      addMessage('jarvis', reply);
+
+      await speak(reply);
+
+      return;
+    }
+
+    setState(() => thinking = true);
+
+    final reply = await askLocal(text);
+
+    if (!mounted) return;
+
+    setState(() => thinking = false);
+
+    addMessage('jarvis', reply);
+
+    await speak(reply);
+  }
+
+  Future<void> speak(String text) async {
+    try {
+      await tts.stop();
+      await tts.setLanguage('fa-IR');
+      await tts.speak(text);
+    } catch (_) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'صدای فارسی روی دستگاه نصب نیست. از تنظیمات تبدیل متن به گفتار، صدای فارسی آفلاین را نصب کن.',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> listen() async {
+    if (listening) {
+      await speechService?.stop();
+
+      if (mounted) {
+        setState(() => listening = false);
+      }
+
+      return;
+    }
+
+    if (speechService == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('مدل تشخیص گفتار هنوز آماده نیست.'),
+          ),
+        );
+      }
+
+      return;
+    }
+
+    final permission = await Permission.microphone.request();
+
+    if (!permission.isGranted) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'برای فرمان صوتی باید اجازهٔ میکروفون بدهی.',
+            ),
+          ),
+        );
+      }
+
+      return;
+    }
+
+    try {
+      await speechService!.start();
+
+      if (mounted) {
+        setState(() => listening = true);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('شروع تشخیص گفتار ناموفق بود: $e'),
+          ),
+        );
+      }
+    }
+  }
+
+  Widget glassPanel({
+    required Widget child,
+    EdgeInsets padding = const EdgeInsets.all(14),
+  }) {
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: panel.withValues(alpha: 0.85),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: cyan.withValues(alpha: 0.24),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: cyan.withValues(alpha: 0.05),
+            blurRadius: 20,
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+
+  Widget statusItem(
+    IconData icon,
+    String label,
+    String value,
+  ) {
+    return Expanded(
+      child: glassPanel(
+        padding: const EdgeInsets.symmetric(
+          vertical: 12,
+          horizontal: 5,
+        ),
+        child: Column(
+          children: [
+            Icon(icon, color: cyan, size: 22),
+            const SizedBox(height: 7),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white60,
+                fontSize: 10,
               ),
-              home: const ChatPage(),
-            );
-          }
+            ),
+            const SizedBox(height: 4),
+            Text(
+              value,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: cyan,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-          class ChatPage extends StatefulWidget {
-            const ChatPage({super.key});
-            @override
-            State<ChatPage> createState() => _ChatPageState();
-          }
+  Widget core() {
+    return AnimatedBuilder(
+      animation: pulse,
+      builder: (context, child) {
+        final t = pulse.value;
 
-          class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin {
-            final input = TextEditingController();
-            final scroll = ScrollController();
-            final tts = FlutterTts();
-            final llama = LlamaController();
-            final vosk = VoskFlutterPlugin.instance();
-            final modelLoader = ModelLoader();
-            final messages = <Map<String, String>>[
-              {'from': 'jarvis', 'text': 'سلام! من جارویس فارسی هستم. مدل‌های آفلاین در حال آماده‌سازی هستند.'}
-            ];
-            final chatHistory = <ChatMessage>[];
-            late final AnimationController pulse;
-            Model? speechModel;
-            Recognizer? recognizer;
-            SpeechService? speechService;
-            StreamSubscription<dynamic>? resultSubscription;
-            StreamSubscription<dynamic>? partialSubscription;
-            bool listening = false;
-            bool thinking = false;
-            bool modelsReady = false;
-            String systemStatus = 'در حال بارگذاری مدل‌های آفلاین';
+        return SizedBox(
+          width: 190,
+          height: 190,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: 170 + t * 8,
+                height: 170 + t * 8,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: cyan.withValues(alpha: 0.2 + t * 0.3),
+                  ),
+                ),
+              ),
+              Transform.rotate(
+                angle: t * 0.8,
+                child: Container(
+                  width: 144,
+                  height: 144,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: blue.withValues(alpha: 0.8),
+                      width: 2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: cyan.withValues(alpha: 0.08 + t * 0.12),
+                        blurRadius: 28,
+                        spreadRadius: 4,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Container(
+                width: 112,
+                height: 112,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      cyan.withValues(alpha: 0.3),
+                      const Color(0xFF075080),
+                      const Color(0xFF061222),
+                    ],
+                  ),
+                  border: Border.all(
+                    color: cyan.withValues(alpha: 0.8),
+                  ),
+                ),
+                child: const Icon(
+                  Icons.memory_rounded,
+                  color: cyan,
+                  size: 52,
+                ),
+              ),
+              Positioned(
+                top: 12,
+                right: 28,
+                child: Container(
+                  width: 7,
+                  height: 7,
+                  decoration: const BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                    boxShadow: [
+                      BoxShadow(
+                        color: cyan,
+                        blurRadius: 10,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
-            @override
-            void initState() {
-              super.initState();
-              pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 2200))..repeat(reverse: true);
-              tts.setLanguage('fa-IR');
-              tts.setSpeechRate(0.45);
-              initializeOfflineModels();
-            }
-
-            Future<void> initializeOfflineModels() async {
-              try {
-                if (mounted) setState(() => systemStatus = 'آماده‌سازی مدل گفتار فارسی');
-                final voskPath = await modelLoader.loadFromAssets(voskAsset);
-                speechModel = await vosk.createModel(voskPath);
-                recognizer = await vosk.createRecognizer(model: speechModel!, sampleRate: 16000);
-                speechService = await vosk.initSpeechService(recognizer!);
-                resultSubscription = speechService!.onResult().listen((event) {
-                  final text = extractRecognizedText(event.toString());
-                  if (text.isNotEmpty && listening && mounted) {
-                    setState(() => listening = false);
-                    speechService?.stop();
-                    input.text = text;
-                    input.selection = TextSelection.collapsed(offset: input.text.length);
-                    send();
-                  }
-                });
-                partialSubscription = speechService!.onPartial().listen((event) {
-                  final text = extractRecognizedText(event.toString());
-                  if (text.isNotEmpty && listening && mounted) {
-                    input.text = text;
-                    input.selection = TextSelection.collapsed(offset: input.text.length);
-                  }
-                });
-
-                if (mounted) setState(() => systemStatus = 'آماده‌سازی مدل زبانی محلی');
-                final directory = await getApplicationSupportDirectory();
-                final modelFile = File('${directory.path}/qwen2.5-0.5b-instruct-q4_k_m.gguf');
-                if (!await modelFile.exists() || await modelFile.length() < 400000000) {
-                  final data = await rootBundle.load(llmAsset);
-                  await modelFile.writeAsBytes(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes), flush: true);
-                }
-                final gpu = await llama.detectGpu();
-                await llama.loadModel(
-                  modelPath: modelFile.path,
-                  threads: 4,
-                  contextSize: 2048,
-                  gpuLayers: gpu.recommendedGpuLayers,
-                );
-                chatHistory.add(ChatMessage(role: 'system', content: 'تو JARVIS، دستیار شخصی فارسی هستی. به فارسی روان، کوتاه و مفید پاسخ بده. اگر پاسخ را نمی‌دانی، صادقانه بگو. ادعا نکن که به امکانات گوشی دسترسی داری یا کاری را انجام داده‌ای مگر واقعاً انجام شده باشد. تمام پردازش‌ها روی همین دستگاه انجام می‌شوند.'));
-                if (!mounted) return;
-                setState(() { modelsReady = true; systemStatus = 'کاملاً آفلاین و آماده'; });
-                addMessage('jarvis', 'مدل محلی بارگذاری شد. اکنون می‌توانی بدون اینترنت با من گفت‌وگو کنی.');
-              } catch (e) {
-                if (!mounted) return;
-                setState(() => systemStatus = 'خطا در بارگذاری مدل آفلاین');
-                addMessage('jarvis', 'بارگذاری مدل انجام نشد. جزئیات: $e');
-              }
-            }
-
-            String extractRecognizedText(String raw) {
-              try {
-                final value = jsonDecode(raw);
-                if (value is Map) return (value['text'] ?? value['partial'] ?? '').toString().trim();
-              } catch (_) {}
-              return raw.trim();
-            }
-
-            @override
-            void dispose() {
-              resultSubscription?.cancel();
-              partialSubscription?.cancel();
-              speechService?.stop();
-              llama.dispose();
-              pulse.dispose(); input.dispose(); scroll.dispose(); tts.stop();
-              super.dispose();
-            }
-
-            void addMessage(String from, String text) {
-              if (!mounted) return;
-              setState(() => messages.add({'from': from, 'text': text}));
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (scroll.hasClients) scroll.animateTo(scroll.position.maxScrollExtent, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
-              });
-            }
-
-            String offlineAnswer(String raw) {
-              final q = raw.toLowerCase().trim();
-              if (q.contains('سلام') || q.contains('درود')) return 'سلام! آماده‌ام. چه کاری برایت انجام بدهم؟';
-              if (q.contains('اسمت') || q.contains('نامت')) return 'من JARVIS هستم؛ دستیار شخصی فارسی شما.';
-              if (q.contains('ساعت')) { final n = DateTime.now(); return 'ساعت دستگاه ${n.hour}:${n.minute.toString().padLeft(2, '0')} است.'; }
-              if (q.contains('تاریخ')) { final n = DateTime.now(); return 'تاریخ دستگاه: ${n.year}/${n.month}/${n.day}'; }
-              if (q.contains('وضعیت')) return 'هسته جارویس فعال است. حالت اجرا: کاملاً آفلاین. مدل زبانی: ${modelsReady ? 'آماده' : 'در حال بارگذاری'}.';
-              if (q.contains('راهنما') || q.contains('چه کار')) return 'می‌توانم به کمک مدل محلی به سؤال‌ها پاسخ بدهم و ساعت و تاریخ دستگاه را اعلام کنم. برای گفتار فارسی، مدل آفلاین گفتار نیز همراه برنامه است.';
-              if (q.contains('خداحافظ')) return 'خداحافظ! هر زمان نیاز داشتی برگرد.';
-              return 'مدل زبانی هنوز آماده نیست. چند لحظه صبر کن و دوباره تلاش کن.';
-            }
-
-            Future<String> askLocal(String prompt) async {
-              if (!modelsReady) return offlineAnswer(prompt);
-              chatHistory.add(ChatMessage(role: 'user', content: prompt));
-              if (chatHistory.length > 13) {
-                chatHistory.removeRange(1, chatHistory.length - 12);
-              }
-              final buffer = StringBuffer();
-              final completer = Completer<String>();
-              StreamSubscription<String>? subscription;
-              subscription = llama.generateChat(
-                messages: List<ChatMessage>.from(chatHistory),
-                template: 'chatml',
-                temperature: 0.7,
-                maxTokens: 256,
-              ).listen(
-                (token) => buffer.write(token),
-                onError: (Object error) { if (!completer.isCompleted) completer.completeError(error); },
-                onDone: () { if (!completer.isCompleted) completer.complete(buffer.toString().trim()); },
-              );
-              try {
-                final reply = await completer.future.timeout(const Duration(minutes: 2));
-                await subscription.cancel();
-                if (reply.isEmpty) throw Exception('مدل پاسخ خالی داد');
-                chatHistory.add(ChatMessage(role: 'assistant', content: reply));
-                return reply;
-              } catch (_) {
-                await subscription.cancel();
-                if (chatHistory.length > 1) chatHistory.removeLast();
-                return offlineAnswer(prompt);
-              }
-            }
-
-            Future<void> send() async {
-              final text = input.text.trim();
-              if (text.isEmpty || thinking) return;
-              input.clear(); HapticFeedback.selectionClick(); addMessage('user', text);
-              final q = text.toLowerCase();
-              final local = ['ساعت', 'تاریخ', 'سلام', 'درود', 'اسمت', 'نامت', 'خداحافظ', 'راهنما', 'چه کار', 'وضعیت'].any(q.contains);
-              if (local) { final reply = offlineAnswer(text); addMessage('jarvis', reply); await speak(reply); return; }
-              if (!modelsReady) { final reply = 'مدل محلی هنوز در حال بارگذاری است؛ چند لحظه صبر کن.'; addMessage('jarvis', reply); await speak(reply); return; }
-              setState(() => thinking = true);
-              final reply = await askLocal(text);
-              if (!mounted) return;
-              setState(() => thinking = false); addMessage('jarvis', reply); await speak(reply);
-            }
-
-            Future<void> speak(String text) async {
-              try { await tts.stop(); await tts.setLanguage('fa-IR'); await tts.speak(text); }
-              catch (_) { if (!mounted) return; ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('صدای فارسی روی دستگاه نصب نیست. از تنظیمات تبدیل متن به گفتار، صدای فارسی آفلاین را نصب کن.'))); }
-            }
-
-            Future<void> listen() async {
-              if (listening) {
-                await speechService?.stop();
-                if (mounted) setState(() => listening = false);
-                return;
-              }
-              if (speechService == null) {
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('مدل تشخیص گفتار هنوز آماده نیست.')));
-                return;
-              }
-              final permission = await Permission.microphone.request();
-              if (!permission.isGranted) {
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('برای فرمان صوتی باید اجازهٔ میکروفون بدهی.')));
-                return;
-              }
-              try {
-                await speechService!.start();
-                if (mounted) setState(() => listening = true);
-              } catch (e) {
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('شروع تشخیص گفتار ناموفق بود: $e')));
-              }
-            }
-
-            Widget glassPanel({required Widget child, EdgeInsets padding = const EdgeInsets.all(14)}) => Container(
-              padding: padding,
-              decoration: BoxDecoration(color: panel.withValues(alpha: 0.85), borderRadius: BorderRadius.circular(18), border: Border.all(color: cyan.withValues(alpha: 0.24)), boxShadow: [BoxShadow(color: cyan.withValues(alpha: 0.05), blurRadius: 20)]),
-              child: child,
-            );
-
-            Widget statusItem(IconData icon, String label, String value) => Expanded(child: glassPanel(
-              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 5),
-              child: Column(children: [Icon(icon, color: cyan, size: 22), const SizedBox(height: 7), Text(label, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white60, fontSize: 10)), const SizedBox(height: 4), Text(value, textAlign: TextAlign.center, style: const TextStyle(color: cyan, fontSize: 11, fontWeight: FontWeight.bold))]),
-            ));
-
-            Widget core() => AnimatedBuilder(animation: pulse, builder: (context, child) {
-              final t = pulse.value;
-              return SizedBox(width: 190, height: 190, child: Stack(alignment: Alignment.center, children: [
-                Container(width: 170 + t * 8, height: 170 + t * 8, decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: cyan.withValues(alpha: 0.2 + t * 0.3)))),
-                Transform.rotate(angle: t * 0.8, child: Container(width: 144, height: 144, decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: blue.withValues(alpha: 0.8), width: 2), boxShadow: [BoxShadow(color: cyan.withValues(alpha: 0.08 + t * 0.12), blurRadius: 28, spreadRadius: 4)]))),
-                Container(width: 112, height: 112, decoration: BoxDecoration(shape: BoxShape.circle, gradient: RadialGradient(colors: [cyan.withValues(alpha: 0.3), const Color(0xFF075080), const Color(0xFF061222)]), border: Border.all(color: cyan.withValues(alpha: 0.8))), child: const Icon(Icons.memory_rounded, color: cyan, size: 52)),
-                Positioned(top: 12, right: 28, child: Container(width: 7, height: 7, decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle, boxShadow: [BoxShadow(color: cyan, blurRadius: 10)]))),
-              ]));
-            });
-
-            @override
-            Widget build(BuildContext context) => Scaffold(
-              appBar: AppBar(backgroundColor: bg, title: const Row(children: [Icon(Icons.hexagon_outlined, color: cyan, size: 28), SizedBox(width: 10), Text('J.A.R.V.I.S', style: TextStyle(letterSpacing: 3, fontWeight: FontWeight.w800))]),
-                actions: [Padding(padding: const EdgeInsets.only(right: 14), child: Icon(Icons.offline_bolt, color: modelsReady ? cyan : Colors.white38)), const SizedBox(width: 8)]),
-              body: SafeArea(child: Column(children: [
-                Expanded(child: ListView(controller: scroll, padding: const EdgeInsets.fromLTRB(16, 10, 16, 16), children: [
-                  const Center(child: Text('LOCAL AI INTERFACE', style: TextStyle(color: cyan, fontSize: 10, letterSpacing: 3))),
-                  const SizedBox(height: 8), Center(child: core()), const SizedBox(height: 8),
-                  const Center(child: Text('هسته مرکزی جارویس', style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold))), const SizedBox(height: 6),
-                  Center(child: Row(mainAxisSize: MainAxisSize.min, children: [Container(width: 7, height: 7, decoration: BoxDecoration(color: modelsReady ? const Color(0xFF39FFB6) : Colors.orange, shape: BoxShape.circle)), const SizedBox(width: 7), Flexible(child: Text(thinking ? 'مدل محلی در حال پاسخ‌گویی' : listening ? 'تشخیص گفتار آفلاین فعال' : systemStatus, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white60, fontSize: 12)))])),
-                  const SizedBox(height: 22), Row(children: [statusItem(Icons.memory, 'مدل زبانی', modelsReady ? 'آماده' : 'بارگذاری'), const SizedBox(width: 8), statusItem(Icons.mic_none, 'میکروفون', listening ? 'شنود' : 'آفلاین'), const SizedBox(width: 8), statusItem(Icons.wifi_off, 'شبکه', 'بدون اینترنت')]),
-                  const SizedBox(height: 22), Row(children: [const Icon(Icons.terminal, color: cyan, size: 20), const SizedBox(width: 8), const Text('گزارش ارتباط', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)), const Spacer(), Text('${messages.length} پیام', style: const TextStyle(color: Colors.white38, fontSize: 11))]),
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: bg,
+        title: const Row(
+          children: [
+            Icon(
+              Icons.hexagon_outlined,
+              color: cyan,
+              size: 28,
+            ),
+            SizedBox(width: 10),
+            Text(
+              'J.A.R.V.I.S',
+              style: TextStyle(
+                letterSpacing: 3,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 14),
+            child: Icon(
+              Icons.offline_bolt,
+              color: modelsReady ? cyan : Colors.white38,
+            ),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: ListView(
+                controller: scroll,
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+                children: [
+                  const Center(
+                    child: Text(
+                      'LOCAL AI INTERFACE',
+                      style: TextStyle(
+                        color: cyan,
+                        fontSize: 10,
+                        letterSpacing: 3,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Center(child: core()),
+                  const SizedBox(height: 8),
+                  const Center(
+                    child: Text(
+                      'هسته مرکزی جارویس',
+                      style: TextStyle(
+                        fontSize: 21,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Center(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: modelsReady
+                                ? const Color(0xFF39FFB6)
+                                : Colors.orange,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 7),
+                        Flexible(
+                          child: Text(
+                            thinking
+                                ? 'مدل محلی در حال پاسخ‌گویی'
+                                : listening
+                                    ? 'تشخیص گفتار آفلاین فعال'
+                                    : systemStatus,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  Row(
+                    children: [
+                      statusItem(
+                        Icons.memory,
+                        'مدل زبانی',
+                        modelsReady ? 'آماده' : 'بارگذاری',
+                      ),
+                      const SizedBox(width: 8),
+                      statusItem(
+                        Icons.mic_none,
+                        'میکروفون',
+                        listening ? 'شنود' : 'آفلاین',
+                      ),
+                      const SizedBox(width: 8),
+                      statusItem(
+                        Icons.wifi_off,
+                        'شبکه',
+                        'بدون اینترنت',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 22),
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.terminal,
+                        color: cyan,
+                        size: 20,
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'گزارش ارتباط',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 15,
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(
+                        '${messages.length} پیام',
+                        style: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 12),
-                  ...messages.map((item) { final mine = item['from'] == 'user'; return Align(alignment: mine ? Alignment.centerRight : Alignment.centerLeft, child: Container(constraints: const BoxConstraints(maxWidth: 320), margin: const EdgeInsets.only(bottom: 10), padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: mine ? const Color(0xFF073A59) : panel, borderRadius: BorderRadius.circular(16), border: Border.all(color: (mine ? blue : cyan).withValues(alpha: 0.3))), child: Text(item['text']!, textDirection: TextDirection.rtl, style: const TextStyle(fontSize: 15, height: 1.7)))); }),
-                ])),
-                Container(padding: const EdgeInsets.fromLTRB(12, 12, 12, 12), decoration: BoxDecoration(color: const Color(0xFF06111F), border: Border(top: BorderSide(color: cyan.withValues(alpha: 0.22)))), child: Row(children: [
-                  Container(decoration: BoxDecoration(color: listening ? const Color(0xFF123E55) : panel, shape: BoxShape.circle, border: Border.all(color: cyan.withValues(alpha: 0.5))), child: IconButton(onPressed: listen, icon: Icon(listening ? Icons.stop : Icons.mic_none, color: cyan), tooltip: 'فرمان صوتی آفلاین')),
-                  const SizedBox(width: 9), Expanded(child: TextField(controller: input, textDirection: TextDirection.rtl, onSubmitted: (_) => send(), decoration: InputDecoration(hintText: 'فرمان خود را وارد کنید...', hintStyle: const TextStyle(color: Colors.white38, fontSize: 13), filled: true, fillColor: panel, contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide(color: cyan.withValues(alpha: 0.2))), enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide(color: cyan.withValues(alpha: 0.2))))),
-                  const SizedBox(width: 9), Container(decoration: const BoxDecoration(gradient: LinearGradient(colors: [cyan, blue]), shape: BoxShape.circle), child: IconButton(onPressed: thinking ? null : send, icon: Icon(thinking ? Icons.hourglass_top : Icons.arrow_upward_rounded, color: bg), tooltip: 'ارسال فرمان')),
-                ])),
-              ])),
-            );
-          }
-          DART
+                  ...messages.map((item) {
+                    final mine = item['from'] == 'user';
 
-      - name: Build release APK
-        working-directory: jarvis_app
-        run: flutter build apk --release
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: jarvis-persian-fully-offline-apk
-          path: jarvis_app/build/app/outputs/flutter-apk/app-release.apk
-          compression-level: 0
+                    return Align(
+                      alignment: mine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: Container(
+                        constraints: const BoxConstraints(
+                          maxWidth: 320,
+                        ),
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: mine
+                              ? const Color(0xFF073A59)
+                              : panel,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: (mine ? blue : cyan)
+                                .withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: Text(
+                          item['text']!,
+                          textDirection: TextDirection.rtl,
+                          style: const TextStyle(
+                            fontSize: 15,
+                            height: 1.7,
+                          ),
+                        ),
+                      ),
+                    );
+                  }),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF06111F),
+                border: Border(
+                  top: BorderSide(
+                    color: cyan.withValues(alpha: 0.22),
+                  ),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: listening
+                          ? const Color(0xFF123E55)
+                          : panel,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: cyan.withValues(alpha: 0.5),
+                      ),
+                    ),
+                    child: IconButton(
+                      onPressed: listen,
+                      icon: Icon(
+                        listening ? Icons.stop : Icons.mic_none,
+                        color: cyan,
+                      ),
+                      tooltip: 'فرمان صوتی آفلاین',
+                    ),
+                  ),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: TextField(
+                      controller: input,
+                      textDirection: TextDirection.rtl,
+                      onSubmitted: (_) => send(),
+                      decoration: InputDecoration(
+                        hintText: 'فرمان خود را وارد کنید...',
+                        hintStyle: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 13,
+                        ),
+                        filled: true,
+                        fillColor: panel,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 15,
+                        ),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(18),
+                          borderSide: BorderSide(
+                            color: cyan.withValues(alpha: 0.2),
+                          ),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(18),
+                          borderSide: BorderSide(
+                            color: cyan.withValues(alpha: 0.2),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 9),
+                  Container(
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [cyan, blue],
+                      ),
+                      shape: BoxShape.circle,
+                    ),
+                    child: IconButton(
+                      onPressed: thinking ? null : send,
+                      icon: Icon(
+                        thinking
+                            ? Icons.hourglass_top
+                            : Icons.arrow_upward_rounded,
+                        color: bg,
+                      ),
+                      tooltip: 'ارسال فرمان',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
