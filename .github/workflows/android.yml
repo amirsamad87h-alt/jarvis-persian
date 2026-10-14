@@ -223,6 +223,7 @@ jobs:
             bool thinking = false;
             bool modelsReady = false;
             String systemStatus = 'در حال بارگذاری مدل‌های آفلاین';
+            String speechError = ''; 
 
             @override
             void initState() {
@@ -234,6 +235,7 @@ jobs:
             }
 
             Future<void> initializeOfflineModels() async {
+              // Prepare speech independently: a Vosk error must not block typed chat.
               try {
                 if (mounted) setState(() => systemStatus = 'آماده‌سازی مدل گفتار فارسی');
                 final voskPath = await modelLoader.loadFromAssets(voskAsset);
@@ -249,6 +251,9 @@ jobs:
                     input.selection = TextSelection.collapsed(offset: input.text.length);
                     send();
                   }
+                }, onError: (Object e) {
+                  speechError = e.toString();
+                  if (mounted) setState(() => systemStatus = 'خطا در تشخیص گفتار');
                 });
                 partialSubscription = speechService!.onPartial().listen((event) {
                   final text = extractRecognizedText(event.toString());
@@ -256,9 +261,22 @@ jobs:
                     input.text = text;
                     input.selection = TextSelection.collapsed(offset: input.text.length);
                   }
-                });
+                }, onError: (Object e) { speechError = e.toString(); });
+                if (mounted) setState(() => systemStatus = 'مدل گفتار آماده است؛ بارگذاری مدل زبانی');
+              } catch (e) {
+                speechError = e.toString();
+                if (mounted) {
+                  setState(() => systemStatus = 'گفتار آماده نیست؛ چت متنی قابل استفاده است');
+                  addMessage('jarvis', 'راه‌اندازی میکروفون ناموفق بود: $speechError');
+                }
+              }
 
-                if (mounted) setState(() => systemStatus = 'آماده‌سازی مدل زبانی محلی');
+              // Load the language model separately so speech initialization errors
+              // cannot prevent the rest of the assistant from starting.
+              try {
+                if (mounted) setState(() => systemStatus = speechService == null
+                    ? 'بارگذاری مدل زبانی محلی؛ گفتار در دسترس نیست'
+                    : 'آماده‌سازی مدل زبانی محلی');
                 final directory = await getApplicationSupportDirectory();
                 final modelFile = File('${directory.path}/qwen2.5-0.5b-instruct-q4_k_m.gguf');
                 if (!await modelFile.exists() || await modelFile.length() < 400000000) {
@@ -274,12 +292,14 @@ jobs:
                 );
                 chatHistory.add(ChatMessage(role: 'system', content: 'تو JARVIS، دستیار شخصی فارسی هستی. به فارسی روان، کوتاه و مفید پاسخ بده. اگر پاسخ را نمی‌دانی، صادقانه بگو. ادعا نکن که به امکانات گوشی دسترسی داری یا کاری را انجام داده‌ای مگر واقعاً انجام شده باشد. تمام پردازش‌ها روی همین دستگاه انجام می‌شوند.'));
                 if (!mounted) return;
-                setState(() { modelsReady = true; systemStatus = 'کاملاً آفلاین و آماده'; });
-                addMessage('jarvis', 'مدل محلی بارگذاری شد. اکنون می‌توانی بدون اینترنت با من گفت‌وگو کنی.');
+                setState(() { modelsReady = true; systemStatus = speechService == null ? 'مدل زبانی آماده؛ گفتار غیرفعال' : 'کاملاً آفلاین و آماده'; });
+                addMessage('jarvis', speechService == null
+                    ? 'مدل زبانی آماده است، اما تشخیص گفتار راه‌اندازی نشد. فعلاً از کادر تایپ استفاده کن. جزئیات خطای گفتار: $speechError'
+                    : 'مدل‌های محلی بارگذاری شدند. اکنون می‌توانی بدون اینترنت با من گفت‌وگو کنی.');
               } catch (e) {
                 if (!mounted) return;
-                setState(() => systemStatus = 'خطا در بارگذاری مدل آفلاین');
-                addMessage('jarvis', 'بارگذاری مدل انجام نشد. جزئیات: $e');
+                setState(() => systemStatus = 'مدل زبانی بارگذاری نشد');
+                addMessage('jarvis', 'بارگذاری مدل زبانی انجام نشد. جزئیات: $e');
               }
             }
 
@@ -312,7 +332,7 @@ jobs:
             String offlineAnswer(String raw) {
               final q = raw.toLowerCase().trim();
               if (q.contains('سلام') || q.contains('درود')) return 'سلام! آماده‌ام. چه کاری برایت انجام بدهم؟';
-              if (q.contains('اسمت') || q.contains('نامت')) return 'من JARVIS هستم؛ دستیار شخصی فارسی شما.';
+              if (q.contains('اسمت') || q.contains('نامت') || q.contains('معرفی کن') || q.contains('خودت را معرفی') || q.contains('خودتو معرفی')) return 'سلام! من JARVIS هستم؛ دستیار شخصی فارسی شما. برای حفظ حریم خصوصی، تلاش می‌کنم پردازش‌ها را روی خود گوشی انجام بدهم و در حال حاضر می‌توانم به پرسش‌ها پاسخ بدهم و فرمان‌های پایه را اجرا کنم.';
               if (q.contains('ساعت')) { final n = DateTime.now(); return 'ساعت دستگاه ${n.hour}:${n.minute.toString().padLeft(2, '0')} است.'; }
               if (q.contains('تاریخ')) { final n = DateTime.now(); return 'تاریخ دستگاه: ${n.year}/${n.month}/${n.day}'; }
               if (q.contains('وضعیت')) return 'هسته جارویس فعال است. حالت اجرا: کاملاً آفلاین. مدل زبانی: ${modelsReady ? 'آماده' : 'در حال بارگذاری'}.';
@@ -358,7 +378,7 @@ jobs:
               if (text.isEmpty || thinking) return;
               input.clear(); HapticFeedback.selectionClick(); addMessage('user', text);
               final q = text.toLowerCase();
-              final local = ['ساعت', 'تاریخ', 'سلام', 'درود', 'اسمت', 'نامت', 'خداحافظ', 'راهنما', 'چه کار', 'وضعیت'].any(q.contains);
+              final local = ['ساعت', 'تاریخ', 'سلام', 'درود', 'اسمت', 'نامت', 'معرفی کن', 'خودت را معرفی', 'خودتو معرفی', 'خداحافظ', 'راهنما', 'چه کار', 'وضعیت'].any(q.contains);
               if (local) { final reply = offlineAnswer(text); addMessage('jarvis', reply); await speak(reply); return; }
               if (!modelsReady) { final reply = 'مدل محلی هنوز در حال بارگذاری است؛ چند لحظه صبر کن.'; addMessage('jarvis', reply); await speak(reply); return; }
               setState(() => thinking = true);
@@ -379,7 +399,7 @@ jobs:
                 return;
               }
               if (speechService == null) {
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('مدل تشخیص گفتار هنوز آماده نیست.')));
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(speechError.isEmpty ? 'مدل تشخیص گفتار هنوز آماده نیست. وضعیت: $systemStatus' : 'مدل گفتار آماده نشد: $speechError')));
                 return;
               }
               final permission = await Permission.microphone.request();
