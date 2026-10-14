@@ -35,7 +35,9 @@ jobs:
           flutter pub add vosk_flutter
           flutter pub add llama_flutter_android
           flutter pub add path_provider
-          flutter pub add permission_handler
+          # Pin a modern release: older permission_handler_android 10.x
+          # still references the removed PluginRegistry.Registrar API.
+          flutter pub add permission_handler:^12.0.3
 
       - name: Fix Vosk Android namespace for modern Gradle
         working-directory: jarvis_app
